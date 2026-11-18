@@ -1,0 +1,32 @@
+# Safety net for the whole repo (backend/ and frontend/ have their own .gitignore too).
+
+# Dependencies and build output
+node_modules/
+.next/
+out/
+build/
+coverage/
+*.tsbuildinfo
+
+# Secrets: never committed (copy backend/.env.example to backend/.env on each machine)
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Personal data: database backups, uploaded call recordings, exports
+backups/
+uploads/
+storage-reports/
+*.sql.bak
+*.dump
+
+# Downloaded models, logs, editor and OS files
+models/
+*.log
+npm-debug.log*
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

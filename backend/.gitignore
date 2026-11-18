@@ -1,0 +1,32 @@
+# Dependencies
+node_modules/
+
+# Environment variables / secrets
+.env
+.env.*
+!.env.example
+
+# Logs
+*.log
+npm-debug.log*
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Uploaded audio and chat files
+uploads/
+
+# Database backups (personal data: people, phone numbers, call notes). Never committed.
+backups/
+*.sql.bak
+*.dump
+
+# Downloaded ML models (diarization)
+models/
+
+# OCI audio migration reports (file names, no secrets) and private keys
+storage-reports/
+*.pem

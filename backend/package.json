@@ -1,0 +1,41 @@
+{
+  "name": "teemly-backend",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Tamil-English Meeting Audio Analysis API (Node.js + Express, Gemini on Vertex AI via ADC)",
+  "type": "module",
+  "main": "src/server.js",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "node --watch src/server.js",
+    "test": "node --test --test-concurrency=1 \"tests/offline.test.js\" \"tests/storage.test.js\" \"tests/people.test.js\"",
+    "test:db": "node --test --test-concurrency=1 \"tests/db.test.js\" \"tests/auth.test.js\" \"tests/people-db.test.js\"",
+    "db:migrate": "node src/db/migrate.js",
+    "db:status": "node src/db/migrate.js --status",
+    "live-check": "node tests/live-check.js",
+    "storage:check": "node src/storage/cli.js check",
+    "storage:migrate": "node src/storage/cli.js migrate"
+  },
+  "dependencies": {
+    "@ffprobe-installer/ffprobe": "2.1.2",
+    "@google/genai": "2.32.0",
+    "busboy": "1.6.0",
+    "dotenv": "18.0.9",
+    "express": "5.3.0",
+    "ffmpeg-static": "5.3.0",
+    "google-auth-library": "10.9.1",
+    "mysql2": "3.24.6",
+    "nodemailer": "10.3.1",
+    "oci-common": "2.144.0",
+    "oci-objectstorage": "2.144.0",
+    "playwright-core": "1.64.1",
+    "sherpa-onnx-node": "2.0.1",
+    "zod": "4.6.7"
+  },
+  "allowScripts": {
+    "ffmpeg-static@5.3.0": true
+  }
+}

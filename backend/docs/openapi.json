@@ -1,0 +1,700 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Tamil-English Meeting Audio Analysis API",
+    "version": "0.1.0",
+    "description": "Node.js + Express backend: transcription, translation, emotions, summaries, Pulse and PDF export with Gemini on Vertex AI."
+  },
+  "paths": {
+    "/health": {
+      "get": {
+        "tags": [
+          "health"
+        ],
+        "summary": "Health Check",
+        "description": "Liveness check used to confirm the backend is running.",
+        "operationId": "health_check_health_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": {
+                    "type": "string"
+                  },
+                  "type": "object",
+                  "title": "Response Health Check Health Get"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/audio/upload": {
+      "post": {
+        "tags": [
+          "audio"
+        ],
+        "summary": "Upload Audio",
+        "operationId": "upload_audio_api_audio_upload_post",
+        "requestBody": {
+          "content": {
+            "multipart/form-data": {
+              "schema": {
+                "$ref": "#/components/schemas/Body_upload_audio_api_audio_upload_post"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "Uploaded. The response includes `metadata` (AudioMetadata). Content that is not readable audio is rejected with 422.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "type": "object",
+                  "title": "Response Upload Audio Api Audio Upload Post",
+                  "properties": {
+                    "filename": {
+                      "type": "string"
+                    },
+                    "original_filename": {
+                      "type": "string"
+                    },
+                    "file_size": {
+                      "type": "integer"
+                    },
+                    "file_format": {
+                      "type": "string"
+                    },
+                    "metadata": {
+                      "$ref": "#/components/schemas/AudioMetadata"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/audio/transcribe": {
+      "post": {
+        "tags": [
+          "transcription"
+        ],
+        "summary": "Transcribe Audio",
+        "operationId": "transcribe_audio_api_audio_transcribe_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TranscribeRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "type": "object",
+                  "title": "Response Transcribe Audio Api Audio Transcribe Post"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/analysis": {
+      "post": {
+        "tags": [
+          "analysis"
+        ],
+        "summary": "Start Analysis",
+        "description": "Start transcription, translation, speaker identification and meeting analysis. Refused with 409 if the stored file no longer matches the SHA-256 recorded at upload.",
+        "operationId": "start_analysis_api_analysis_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AnalysisRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "type": "object",
+                  "title": "Response Start Analysis Api Analysis Post"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/analysis/{job_id}": {
+      "get": {
+        "tags": [
+          "analysis"
+        ],
+        "summary": "Get Analysis",
+        "description": "Poll this endpoint for progress; `result` is filled in when status is 'completed'.",
+        "operationId": "get_analysis_api_analysis__job_id__get",
+        "parameters": [
+          {
+            "name": "job_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Job Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Job status and result; audio jobs include `audio` (AudioMetadata), from memory or MySQL.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "title": "Response Get Analysis Api Analysis  Job Id  Get",
+                  "properties": {
+                    "audio": {
+                      "$ref": "#/components/schemas/AudioMetadata"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/ai/status": {
+      "get": {
+        "tags": [
+          "ai"
+        ],
+        "summary": "Ai Status",
+        "description": "Check ADC credentials, project and access to both Gemini models (makes two tiny model calls).",
+        "operationId": "ai_status_api_ai_status_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "type": "object",
+                  "title": "Response Ai Status Api Ai Status Get"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/ai/translate": {
+      "post": {
+        "tags": [
+          "ai"
+        ],
+        "summary": "Translate",
+        "operationId": "translate_api_ai_translate_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TranslateRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "type": "object",
+                  "title": "Response Translate Api Ai Translate Post"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/ai/summarize": {
+      "post": {
+        "tags": [
+          "ai"
+        ],
+        "summary": "Summarize",
+        "operationId": "summarize_api_ai_summarize_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SummarizeRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "type": "object",
+                  "title": "Response Summarize Api Ai Summarize Post"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/whatsapp/{job_id}": {
+      "get": {
+        "tags": [
+          "whatsapp"
+        ],
+        "summary": "Get Chat Job",
+        "operationId": "get_chat_job_api_whatsapp__job_id__get",
+        "parameters": [
+          {
+            "name": "job_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Job Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "title": "Response Get Chat Job Api Whatsapp  Job Id  Get"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "description": "A chat analysed before WhatsApp chat upload was removed (read only)."
+      }
+    },
+    "/api/export/pdf": {
+      "post": {
+        "tags": [
+          "export"
+        ],
+        "summary": "Export Report Pdf",
+        "description": "Download the full conversation context of a completed job as a Teemly PDF report.",
+        "operationId": "export_pdf_api_export_pdf_post",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "job_id"
+                ],
+                "properties": {
+                  "job_id": {
+                    "type": "string",
+                    "title": "Job Id"
+                  },
+                  "title": {
+                    "type": "string",
+                    "title": "Title",
+                    "maxLength": 200,
+                    "default": "Conversation"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "PDF report",
+            "content": {
+              "application/pdf": {}
+            }
+          },
+          "404": {
+            "description": "Job not found"
+          },
+          "409": {
+            "description": "Analysis not finished"
+          },
+          "503": {
+            "description": "No browser available for PDF rendering"
+          }
+        }
+      }
+    },
+    "/api/db/status": {
+      "get": {
+        "tags": [
+          "database"
+        ],
+        "summary": "Database Status",
+        "description": "MySQL connection, user, server version and applied migrations (no credentials).",
+        "operationId": "db_status_api_db_status_get",
+        "responses": {
+          "200": {
+            "description": "Status",
+            "content": {
+              "application/json": {}
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "AnalysisRequest": {
+        "properties": {
+          "filename": {
+            "type": "string",
+            "title": "Filename",
+            "description": "Stored filename returned by POST /api/audio/upload",
+            "examples": [
+              "9c0f06a0b6ae41f898a36b5d10aa7eac.wav"
+            ]
+          },
+          "num_speakers": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "maximum": 20,
+                "minimum": 1
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Num Speakers",
+            "description": "Number of speakers, if known. Leave empty to detect automatically."
+          }
+        },
+        "type": "object",
+        "required": [
+          "filename"
+        ],
+        "title": "AnalysisRequest"
+      },
+      "Body_upload_audio_api_audio_upload_post": {
+        "properties": {
+          "file": {
+            "type": "string",
+            "format": "binary",
+            "title": "File",
+            "description": "Meeting or call recording (wav, mp3, m4a, flac, aac, amr, 3gp, ogg, opus, mp4, webm)"
+          }
+        },
+        "type": "object",
+        "required": [
+          "file"
+        ],
+        "title": "Body_upload_audio_api_audio_upload_post"
+      },
+      "HTTPValidationError": {
+        "properties": {
+          "detail": {
+            "items": {
+              "$ref": "#/components/schemas/ValidationError"
+            },
+            "type": "array",
+            "title": "Detail"
+          }
+        },
+        "type": "object",
+        "title": "HTTPValidationError"
+      },
+      "SummarizeRequest": {
+        "properties": {
+          "text": {
+            "type": "string",
+            "maxLength": 200000,
+            "minLength": 1,
+            "title": "Text",
+            "description": "Transcript, notes or chat text"
+          },
+          "kind": {
+            "type": "string",
+            "enum": [
+              "meeting",
+              "chat"
+            ],
+            "title": "Kind",
+            "default": "meeting"
+          }
+        },
+        "type": "object",
+        "required": [
+          "text"
+        ],
+        "title": "SummarizeRequest"
+      },
+      "TranscribeRequest": {
+        "properties": {
+          "filename": {
+            "type": "string",
+            "title": "Filename",
+            "description": "Stored filename returned by POST /api/audio/upload",
+            "examples": [
+              "9c0f06a0b6ae41f898a36b5d10aa7eac.wav"
+            ]
+          }
+        },
+        "type": "object",
+        "required": [
+          "filename"
+        ],
+        "title": "TranscribeRequest"
+      },
+      "TranslateRequest": {
+        "properties": {
+          "text": {
+            "type": "string",
+            "maxLength": 200000,
+            "minLength": 1,
+            "title": "Text",
+            "description": "Tamil, Tanglish or mixed text"
+          }
+        },
+        "type": "object",
+        "required": [
+          "text"
+        ],
+        "title": "TranslateRequest"
+      },
+      "ValidationError": {
+        "properties": {
+          "loc": {
+            "items": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "integer"
+                }
+              ]
+            },
+            "type": "array",
+            "title": "Location"
+          },
+          "msg": {
+            "type": "string",
+            "title": "Message"
+          },
+          "type": {
+            "type": "string",
+            "title": "Error Type"
+          }
+        },
+        "type": "object",
+        "required": [
+          "loc",
+          "msg",
+          "type"
+        ],
+        "title": "ValidationError"
+      },
+      "AudioMetadata": {
+        "type": "object",
+        "title": "AudioMetadata",
+        "description": "Audio file details measured with ffprobe at upload and stored in MySQL (audio_files). Values that could not be measured are null. No storage path or checksum is exposed.",
+        "properties": {
+          "original_filename": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "file_format": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "File extension"
+          },
+          "mime_type": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "container_format": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Actual container (ffprobe format_name)"
+          },
+          "codec": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "sample_rate_hz": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "channels": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "bitrate_bps": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "size_bytes": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "duration_seconds": {
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "uploaded_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "metadata_status": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "enum": [
+              "extracted",
+              "unavailable",
+              "failed",
+              null
+            ]
+          }
+        }
+      }
+    }
+  }
+}

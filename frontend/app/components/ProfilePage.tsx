@@ -1,0 +1,232 @@
+"use client";
+
+import Link from "next/link";
+import { useCallback, useEffect, useState } from "react";
+import { type DeviceSession, type Profile, getProfile, revokeDevice, revokeOtherDevices } from "../lib/api";
+import { rupees, whenLabel } from "../lib/people";
+import { useAuth } from "./AuthGate";
+import PeopleChrome from "./PeopleChrome";
+
+const message = (e: unknown, fallback: string) => (e instanceof Error ? e.message : fallback);
+
+/** "16 Nov 2026" */
+const dateLabel = (iso: string | null) => (iso ? new Date(iso).toLocaleDateString("en-IN", { day: "numeric", month: "short", year: "numeric" }) : "—");
+
+function DeviceIcon({ device }: { device: string }) {
+  const phone = /iPhone|Android|iPad/.test(device);
+  return (
+    <span className="pf-dev-icon" aria-hidden="true">
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+        {phone ? (
+          <>
+            <rect x="7" y="2.5" width="10" height="19" rx="2" />
+            <path d="M11 18.5h2" />
+          </>
+        ) : (
+          <>
+            <rect x="3" y="4.5" width="18" height="12" rx="1.5" />
+            <path d="M8 20h8M12 16.5V20" />
+          </>
+        )}
+      </svg>
+    </span>
+  );
+}
+
+function Stat({ label, value, sub, href }: { label: string; value: string; sub?: string; href?: string }) {
+  const body = (
+    <>
+      <span className="pf-stat-label">{label}</span>
+      <span className="pf-stat-value">{value}</span>
+      {sub && <span className="pf-stat-sub">{sub}</span>}
+    </>
+  );
+  return href ? (
+    <Link href={href} className="pf-stat pf-stat-link">
+      {body}
+    </Link>
+  ) : (
+    <div className="pf-stat">{body}</div>
+  );
+}
+
+/** The signed-in owner's profile: account, room at a glance, signed-in devices, sign-in & security. */
+export default function ProfilePage() {
+  const { signOut } = useAuth();
+  const [p, setP] = useState<Profile | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [busy, setBusy] = useState<number | "others" | "signout" | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
+
+  const load = useCallback(async () => {
+    setError(null);
+    try {
+      setP(await getProfile());
+    } catch (e) {
+      setError(message(e, "Could not load your profile."));
+    }
+  }, []);
+  useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- loading external data
+    void load();
+  }, [load]);
+
+  async function signOutDevice(s: DeviceSession) {
+    if (busy || !window.confirm(`Sign out ${s.device}? It will need a new code to open the room.`)) return;
+    setBusy(s.id);
+    setNotice(null);
+    try {
+      await revokeDevice(s.id);
+      setP((x) => (x ? { ...x, sessions: x.sessions.filter((d) => d.id !== s.id) } : x));
+      setNotice(`${s.device} was signed out.`);
+    } catch (e) {
+      setNotice(message(e, "Could not sign out that device."));
+      void load();
+    } finally {
+      setBusy(null);
+    }
+  }
+  async function signOutOthers() {
+    if (busy || !window.confirm("Sign out every other device? Only this one stays signed in.")) return;
+    setBusy("others");
+    setNotice(null);
+    try {
+      const r = await revokeOtherDevices();
+      setP((x) => (x ? { ...x, sessions: x.sessions.filter((d) => d.current) } : x));
+      setNotice(r.signed_out ? `${r.signed_out} other device${r.signed_out === 1 ? " was" : "s were"} signed out.` : "No other devices were signed in.");
+    } catch (e) {
+      setNotice(message(e, "Could not sign out the other devices."));
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  if (error || !p) {
+    return (
+      <PeopleChrome active="profile">
+        <div className="card pl-state" role={error ? "alert" : undefined} aria-busy={!error}>
+          {error ? (
+            <>
+              <p>{error}</p>
+              <button type="button" className="pl-view" onClick={() => void load()}>
+                Try again
+              </button>
+            </>
+          ) : (
+            <span className="auth-spinner" />
+          )}
+        </div>
+      </PeopleChrome>
+    );
+  }
+
+  const { user, room, sessions, security } = p;
+  const others = sessions.filter((s) => !s.current).length;
+  return (
+    <PeopleChrome active="profile">
+      <div className="pl-head">
+        <div>
+          <h1 className="pl-title">My profile</h1>
+          <p className="pl-sub">Your account, your room and the devices signed in to it</p>
+        </div>
+      </div>
+
+      {notice && (
+        <div className="ib-notice" role="status">
+          <span>{notice}</span>
+          <button type="button" aria-label="Dismiss" onClick={() => setNotice(null)}>
+            ×
+          </button>
+        </div>
+      )}
+
+      <section className="card pf-account" aria-label="Account">
+        <span className="pf-avatar" aria-hidden="true">
+          {user.initials}
+        </span>
+        <div className="pf-who">
+          <div className="pf-name-row">
+            <h2 className="pf-name">{user.name}</h2>
+            <span className="pf-role">{user.role === "owner" ? "Owner" : "Member"}</span>
+          </div>
+          <p className="pf-facts">
+            <span>Email {user.email_masked}</span>
+            <span>Member since {dateLabel(user.member_since)}</span>
+            <span>Last sign-in {user.last_login_at ? whenLabel(user.last_login_at) : "—"}</span>
+          </p>
+          <p className="pf-hint">Your name and sign-in email are set on the server (OWNER_NAME and OWNER_EMAIL in backend/.env).</p>
+        </div>
+        <button type="button" className="pa-btn pf-signout" disabled={busy === "signout"} onClick={() => (setBusy("signout"), void signOut())}>
+          {busy === "signout" ? "Signing out…" : "Sign out"}
+        </button>
+      </section>
+
+      {room && (
+        <section className="pf-stats" aria-label="Your room">
+          <Stat label="People" value={String(room.people)} href="/people" />
+          <Stat label="Conversations" value={String(room.conversations)} sub="calls on timelines" />
+          <Stat label="Open opportunities" value={String(room.open_opportunities)} sub={room.open_value_inr ? rupees(room.open_value_inr) : undefined} />
+          <Stat label="Inbox" value={String(room.inbox_pending)} sub={room.inbox_pending ? "waiting for you" : "all clear"} href="/inbox" />
+        </section>
+      )}
+
+      <div className="pf-grid">
+        <section className="card pf-card" aria-label="Signed-in devices">
+          <div className="pf-card-head">
+            <h2 className="pa-card-title">Signed-in devices</h2>
+            {others > 0 && (
+              <button type="button" className="pw-link pw-link-danger" disabled={busy !== null} onClick={() => void signOutOthers()}>
+                {busy === "others" ? "Signing out…" : "Sign out all other devices"}
+              </button>
+            )}
+          </div>
+          <ul className="pf-devices">
+            {sessions.map((s) => (
+              <li key={s.id} className="pf-device">
+                <DeviceIcon device={s.device} />
+                <span className="pf-dev-main">
+                  <span className="pf-dev-name">
+                    {s.device}
+                    {s.current && <span className="pf-this">This device</span>}
+                  </span>
+                  <span className="pf-dev-sub">
+                    Signed in {whenLabel(s.signed_in_at)} · active {whenLabel(s.last_seen_at)} · until {dateLabel(s.expires_at)}
+                  </span>
+                </span>
+                {!s.current && (
+                  <button type="button" className="pa-btn pw-btn" disabled={busy !== null} onClick={() => void signOutDevice(s)}>
+                    {busy === s.id ? "…" : "Sign out"}
+                  </button>
+                )}
+              </li>
+            ))}
+          </ul>
+        </section>
+
+        <section className="card pf-card" aria-label="Sign-in and security">
+          <h2 className="pa-card-title">Sign-in &amp; security</h2>
+          <dl className="pf-list">
+            <div>
+              <dt>Sign-in</dt>
+              <dd>{security.method}</dd>
+            </div>
+            <div>
+              <dt>Codes</dt>
+              <dd>
+                {security.code_delivery === "console" ? "Shown in the backend terminal (development mode, no email sent)" : "Sent by email"} · valid {security.code_minutes} min
+              </dd>
+            </div>
+            <div>
+              <dt>Stay signed in</dt>
+              <dd>{security.session_days} days on each device</dd>
+            </div>
+            <div>
+              <dt>Privacy</dt>
+              <dd>Your number and codes are never stored in plain text; only one-way hashes are kept.</dd>
+            </div>
+          </dl>
+        </section>
+      </div>
+    </PeopleChrome>
+  );
+}
