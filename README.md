@@ -1,98 +1,152 @@
-# Tamil-English Meeting Audio Analysis (POC)
+# Teemly Opportunity Room
 
-Upload a meeting or Android/iPhone call recording → transcript in the original language (Tamil,
-English, Tanglish, Hindi or Telugu), professional English translation, speaker-wise transcript with
-timestamps, meeting summary, key points, decisions, action items and follow-ups. The transcript
-appears as soon as it is ready; the summary and Pulse follow.
+A private CRM built from call recordings. The owner uploads a call (Tamil, English or Tanglish), and the
+app produces:
 
-WhatsApp chat upload was removed: only call recordings are uploaded. Chats analysed before that are
-still shown on people's timelines.
+- the transcript, with speakers and an English translation;
+- the people in the call;
+- the deals that were discussed, with their department;
+- the promises made and when they are due;
+- each person's interest.
 
-AI runs on Google Gemini via Vertex AI (`gemini-3.8-flash` for transcription, translation,
-summaries and Pulse), authenticated with Application Default Credentials — no API keys.
-
-**Teemly Pulse** (right-hand panel) shows evidence-backed interest and intent signals — product
-interest, purchase intent, preferences, pain points, concerns, competitors, commitments — each with
-the speaker, the exact supporting sentence (original + English) and a timestamp that seeks the audio.
+Nothing is added to People without the owner's approval.
 
 ```
-frontend/   Next.js 16 + React 19 + TypeScript   http://127.0.0.1:3000
-backend/    Node.js + Express 5.3                 http://127.0.0.1:8000   (API docs: /docs)
+frontend/   Next.js 16 + React 19 + TypeScript     port 3000 (the only port users reach, behind HTTPS)
+backend/    Node.js 20+ + Express 5 + MySQL 8       port 8000 (127.0.0.1 only; the frontend forwards /api to it)
 ```
 
-## First-time setup
+AI runs on Google Gemini through Vertex AI (`gemini-3.8-flash`). It authenticates with Google
+Application Default Credentials, so the project has no API keys.
 
-Requires Node.js 20 or newer.
+## Features
 
-**Backend** (PowerShell, from `backend/`):
+| Page | What it does |
+|---|---|
+| **Upload** | Upload a call recording (wav, mp3, m4a, ogg, opus, mp4 and more; up to 100 MB). The same recording uploaded twice is refused. |
+| **Today** | Top opportunities, follow-ups (late ones in red), AI insights (at-risk deals first), stage movement, pipeline by department. |
+| **Inbox** | New people found in calls wait here. The AI pre-fills their department and category, and the owner adds them with a phone number. A same-name person is shown with their department and the last 4 digits of their phone. |
+| **People / Person** | Each person's calls timeline, deals, commitments (late ones in red, paged), the people they introduced, and their interest: Very interested / Interested / Slightly interested / Not interested / Not clear yet. |
+| **Opportunity panel** | Board and list of deals across 7 stages, moved by drag and drop. A per-deal AI insight shows the AI's chance vs the stage's, and what would help. |
+| **Departments** | Pipeline and people per department; the owner can add departments. |
+| **Network map, Notifications, PDF export, Settings** | |
+
+Sign-in is by email with a one-time code, for the owner only.
+
+## Server setup (production)
+
+### 1. Requirements
+
+- Node.js 20 or newer, MySQL 8, and nginx (or another HTTPS reverse proxy).
+- A Google Cloud service account with **Vertex AI User** (`roles/aiplatform.user`) on the project, with
+  `aiplatform.googleapis.com` enabled. Attach it to the server, or set `GOOGLE_APPLICATION_CREDENTIALS`
+  to its key file. The key file is never committed.
+- Microsoft Edge or Google Chrome, for PDF export (optional; `EXPORT_BROWSER_PATH` if not on the default path).
+- Speaker-detection models in `backend/models/` (about 45 MB, not in Git). Download them from the official
+  sherpa-onnx releases, or copy the folder from the development machine:
+
+  ```bash
+  cd backend && mkdir -p models && cd models
+  wget https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-segmentation-models/sherpa-onnx-pyannote-segmentation-3-0.tar.bz2
+  tar xjf sherpa-onnx-pyannote-segmentation-3-0.tar.bz2 && rm sherpa-onnx-pyannote-segmentation-3-0.tar.bz2
+  wget https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models/3dspeaker_speech_eres2net_base_sv_zh-cn_3dspeaker_16k.onnx
+  ```
+
+  Expected layout: `models/sherpa-onnx-pyannote-segmentation-3-0/model.onnx` and
+  `models/3dspeaker_speech_eres2net_base_sv_zh-cn_3dspeaker_16k.onnx`.
+
+### 2. Database
+
+Create the database and its two least-privilege users from `backend/db/setup/create_users.template.sql`
+(details in `backend/db/README.md`). Then:
+
+```bash
+cd backend
+npm ci
+cp .env.example .env       # fill it in (see below); never commit it
+npm run db:migrate         # creates / updates all tables (22 migrations)
+```
+
+### 3. Configuration (`backend/.env`)
+
+Every setting is documented in `backend/.env.example`. The ones that matter in production:
+
+| Variable | Value |
+|---|---|
+| `NODE_ENV` | `production`: Secure cookie, API docs off, HSTS, and login codes never printed |
+| `OWNER_EMAIL`, `OWNER_NAME` | the owner's sign-in email and name. **The backend refuses to start in production without `OWNER_EMAIL`.** |
+| `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASS`, `SMTP_FROM` | email for the sign-in codes (Gmail: an App Password) |
+| `DB_*`, `DB_MIGRATION_*` | the MySQL users from step 2 |
+| `AUDIT_HASH_KEY` | a long random string (32+ characters), new for this server |
+| `GOOGLE_CLOUD_PROJECT`, `GOOGLE_CLOUD_LOCATION` | the Vertex AI project |
+| `FRONTEND_ORIGINS` | the public URL, e.g. `https://room.example.com` |
+| `APP_TIMEZONE` | `Asia/Kolkata` |
+
+Frontend: `frontend/.env` holds `BACKEND_URL=http://127.0.0.1:8000` (see `frontend/.env.example`).
+
+Secrets (`SMTP_PASS`, DB passwords, `AUDIT_HASH_KEY`) are shared outside Git, never in the repository.
+
+### 4. Build and run
+
+```bash
+cd backend  && NODE_ENV=production npm start                 # one process only: no PM2 cluster mode
+cd frontend && npm ci && npm run build && npm run start -- -p 3000 -H 127.0.0.1
+```
+
+Run each as a service (systemd or PM2 in fork mode). Run **exactly one backend process**, because
+running analyses and sign-in codes are kept in memory.
+
+### 5. nginx (HTTPS in front of the frontend)
+
+```nginx
+server {
+    listen 443 ssl;
+    server_name room.example.com;
+    # ssl_certificate / ssl_certificate_key ...
+
+    client_max_body_size 101m;          # call recordings up to 100 MB
+    proxy_read_timeout   300s;          # AI insight and PDF export can take a while
+
+    location / {
+        proxy_pass         http://127.0.0.1:3000;
+        proxy_set_header   Host              $host;
+        proxy_set_header   X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header   X-Forwarded-Proto $scheme;
+    }
+}
+```
+
+Do not expose ports 3000 or 8000 to the internet. Without `X-Forwarded-For`, every visitor looks
+like one client to the rate limits.
+
+### 6. Check
+
+- `curl http://127.0.0.1:8000/health` returns `{"status":"success"}`.
+- The backend log shows `MySQL connected`, `Login: ON`, and the speaker models found.
+- Open the site, sign in with the owner email, upload a short call, and check that it appears in Inbox.
+
+## Security and data
+
+- **Login:** every `/api` route needs a session, except `/health` and `/api/auth/*`.
+  - Codes expire in 5 minutes and allow 5 tries; resends are limited.
+  - Sessions are an httpOnly, SameSite=Lax cookie (Secure in production).
+- **Code:** all SQL is parameterized.
+- **Uploads:** checked for size, type, file signature and real audio content (ffprobe), and stored under random names.
+- **Headers and limits:** security headers and CSP on the API and the pages, rate limits on uploads, AI and sign-in, and a CORS allow-list.
+- **Git:** never in the repository (all git-ignored):
+  - `.env` files;
+  - `backend/uploads/` (recordings);
+  - `backend/backups/` (database dumps, personal data);
+  - `backend/models/`.
+- **Logs:** never contain conversation content.
+
+## Development
 
 ```powershell
-npm install
-copy .env.example .env
+cd backend;  npm install; copy .env.example .env; npm run db:migrate; npm run dev   # http://127.0.0.1:8000
+cd frontend; npm install; npm run dev                                                # http://127.0.0.1:3000
 ```
 
-**Google Cloud authentication** (one time, needs the gcloud CLI:
-<https://cloud.google.com/sdk/docs/install>):
-
-```powershell
-gcloud auth application-default login
-gcloud auth application-default set-quota-project project-7c7a86a2-b174-4f5d-8c5
-```
-
-The signed-in account (or the `gemini-app-backend` service account in deployment, via
-`GOOGLE_APPLICATION_CREDENTIALS` or an attached identity) needs **Vertex AI User**
-(`roles/aiplatform.user`) on the project, and `aiplatform.googleapis.com` must be enabled.
-Verify with `GET http://127.0.0.1:8000/api/ai/status` or `npm run live-check` (in `backend/`).
-
-**Frontend** (from `frontend/`):
-
-```powershell
-npm install
-```
-
-## Run
-
-Two terminals:
-
-```powershell
-# Terminal 1 — backend/
-npm start
-```
-
-```powershell
-# Terminal 2 — frontend/
-npm run dev
-```
-
-Open <http://127.0.0.1:3000> and click Upload: choose an audio file (wav, mp3, m4a, flac, aac, amr,
-3gp, ogg, opus, mp4, webm; up to 100 MB).
-
-For production use `npm run build` then `npm run start -- -p 3000 -H 127.0.0.1` in `frontend/`.
-To point the UI at a different backend, set `NEXT_PUBLIC_API_BASE_URL` (see `frontend/.env.example`).
-
-## Security and data protection
-
-- Google credentials stay on the backend (Application Default Credentials, least-privilege
-  `roles/aiplatform.user`); no API keys anywhere, `.env` is git-ignored.
-- The backend listens on 127.0.0.1 only and accepts browser requests only from the configured
-  frontend origins (CORS).
-- Uploads are validated (extension, file signature, size); stored names are random, so paths cannot
-  be guessed or traversed. Uploaded recordings and chats are kept by default; set
-  `UPLOAD_RETENTION_HOURS` to delete them after that many hours (never while a job is using them).
-- Security headers on every response; uploads and AI calls are rate limited per client
-  (`RATE_LIMIT_PER_MINUTE`); request bodies are size-limited.
-- Logs contain no conversation content.
-- Phone OTP sign-in (owner only). It is off until `OWNER_PHONE` (and `OWNER_NAME`) are set in
-  `backend/.env` and migration 003 is applied (`npm run db:migrate`). When on, every API except
-  `/health` and `/api/auth/*` needs a session, and the frontend sends you to `/login`, then to `/people`.
-  - The number is never stored: only an HMAC with `AUDIT_HASH_KEY` (32+ random characters, checked at
-    startup) and its last 4 digits.
-  - Codes are 6 random digits, kept only as HMACs. They expire in 5 minutes and allow 5 tries; resends
-    are limited (30 s apart, 5 per hour per number, 10 per hour per client).
-  - Unknown numbers get the same answer as the owner's, so the API never shows which numbers are allowed.
-  - Sessions use a random token in an httpOnly, SameSite=Lax cookie (7 days, `Secure` in production).
-    Only its SHA-256 is stored, and signing out revokes it.
-  - `OTP_PROVIDER=console` prints the code in the backend terminal for development, and is refused when
-    `NODE_ENV=production`. An SMS provider is needed before going live.
-  - The frontend calls `/api/*` on its own origin, and Next.js forwards those calls to `BACKEND_URL`.
-    That keeps the cookie first-party; leave `NEXT_PUBLIC_API_BASE_URL` unset.
+Tests (backend): `npm test` runs the offline tests; `npm run test:db` runs the MySQL tests on
+`teemly_db_test`. Frontend checks: `npx tsc --noEmit` and `npx eslint .`. More detail is in
+`backend/README.md` and `backend/db/README.md`.
