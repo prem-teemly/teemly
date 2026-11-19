@@ -172,6 +172,15 @@ export async function markUnread(ids) {
   return r.affectedRows;
 }
 
+/**
+ * Clear the current user's notifications (all of them). Their facts stay in notification_facts, so a
+ * cleared notification never comes back on the next sweep; only new things are announced. Returns how many.
+ */
+export async function clearAll() {
+  const [r] = await getPool().query("DELETE FROM notifications WHERE user_id = ? AND kind <> 'system'", [uid()]);
+  return r.affectedRows;
+}
+
 /** When the bell was last opened: rows before that are "seen" (no number on the bell), even if unread. */
 async function getSeenAt() {
   const [[r]] = await getPool().query("SELECT value FROM app_settings WHERE user_id = ? AND name = 'notifications_seen'", [uid()]);

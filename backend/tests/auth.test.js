@@ -434,6 +434,15 @@ test("one room per account: people, opportunities, departments, calls, inbox, co
   assert.equal((await S.post("/api/notifications/read", { all: true })).status, 200);
   assert.equal((await S.post("/api/notifications/read", { ids: [Number(n.id)] })).body.changed, 0);
   assert.equal((await q("SELECT read_at FROM notifications WHERE id = ?", [n.id]))[0].read_at, null, "still unread for Prem");
+  // "Clear all" removes only your own; what was cleared does not come back.
+  assert.equal((await S.post("/api/notifications/clear", {})).status, 200);
+  assert.ok((await titles(P)).includes("Call analysed: Call with Vimal"), "Sanjay's clear leaves Prem's bell alone");
+  const before = await titles(P);
+  const cleared = await P.post("/api/notifications/clear", {});
+  assert.equal(cleared.body.cleared, before.length);
+  assert.deepEqual(await titles(P), [], "Prem's bell is empty");
+  assert.deepEqual(await titles(P), [], "and stays empty on the next check");
+  assert.equal((await q("SELECT COUNT(*) AS n FROM notifications WHERE user_id = ? AND dedupe_key = 'installed'", [prem.id]))[0].n, 1, "the bell's start marker is kept");
   assert.equal((await S.post("/api/notification-settings", { digest: false })).status, 200);
   assert.equal((await P.get("/api/notification-settings")).body.settings.digest, true, "settings are per account");
 

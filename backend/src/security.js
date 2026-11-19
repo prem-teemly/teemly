@@ -39,7 +39,7 @@ export function securityHeaders(req, res, next) {
 // Small edits the owner makes on a person's page or in the inbox (no upload, no AI): not limited, so
 // writing notes or moving an opportunity never hits "Too many requests".
 const LIGHT_EDITS =
-  /^\/api\/(people|people\/[0-9a-f]{32}\/(notes|opportunities|phone|departments)|people\/[0-9a-f]{32}\/mentions\/[0-9a-f]{32}\/move|notes\/[0-9a-f]{32}|opportunities\/[0-9a-f]{32}|commitments\/\d+|inbox\/[0-9a-f]{32}\/(add|ignore)|department-ideas\/[0-9a-f]{32}\/(create|ignore)|departments(\/[0-9a-f]{32})?|notifications\/(read|unread|seen)|notification-settings)$/;
+  /^\/api\/(people|people\/[0-9a-f]{32}\/(notes|opportunities|phone|departments)|people\/[0-9a-f]{32}\/mentions\/[0-9a-f]{32}\/move|notes\/[0-9a-f]{32}|opportunities\/[0-9a-f]{32}|commitments\/\d+|inbox\/[0-9a-f]{32}\/(add|ignore)|department-ideas\/[0-9a-f]{32}\/(create|ignore)|departments(\/[0-9a-f]{32})?|notifications\/(read|unread|seen|clear)|notification-settings)$/;
 
 /**
  * Fixed-window rate limit per client address for POST requests (uploads, job starts, AI calls).

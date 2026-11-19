@@ -44,6 +44,9 @@ export const markRead = (ids: number[]) => call<{ changed: number }>("/api/notif
 export const markUnread = (ids: number[]) => call<{ changed: number }>("/api/notifications/unread", post({ ids }));
 /** The bell was opened: its number goes to 0; the rows stay unread until opened. */
 export const markSeen = () => call<{ status: string }>("/api/notifications/seen", { method: "POST" });
+/** Remove all of your notifications (they are not announced again). */
+export const clearAllNotes = () => call<{ cleared: number }>("/api/notifications/clear", { method: "POST" });
+export const CLEAR_CONFIRM = "Clear all notifications? They are removed for good (the calls, people and deals they are about stay).";
 
 /** Filter options for "View all" (Due & overdue together, Calls with failed uploads). */
 export const NOTE_FILTERS: { value: string; label: string }[] = [

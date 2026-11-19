@@ -3,7 +3,7 @@
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useCallback, useEffect, useRef, useState } from "react";
-import { type Note, getNotes, markAllRead, markRead, markSeen, markUnread } from "../lib/notifications";
+import { CLEAR_CONFIRM, type Note, clearAllNotes, getNotes, markAllRead, markRead, markSeen, markUnread } from "../lib/notifications";
 import { BellIcon, SettingsIcon } from "./Icons";
 import { NoteGroups } from "./NotificationList";
 
@@ -131,6 +131,18 @@ export default function NotificationBell() {
     }
   }
 
+  async function clearAll() {
+    if (!window.confirm(CLEAR_CONFIRM)) return;
+    setItems([]);
+    setUnread(0);
+    setUnseen(0);
+    try {
+      await clearAllNotes();
+    } catch {
+      void load();
+    }
+  }
+
   const shown = tab === "unread" ? items.filter((n) => !n.read) : items;
   const label = unseen ? `Notifications: ${unseen} new` : unread ? `Notifications: ${unread} unread` : "Notifications";
   return (
@@ -180,6 +192,9 @@ export default function NotificationBell() {
             </Link>
             <button type="button" className="nb-readall" onClick={() => void readAll()} disabled={!unread}>
               ✓✓ Mark all as read
+            </button>
+            <button type="button" className="nb-readall nb-clear" onClick={() => void clearAll()} disabled={!items.length}>
+              Clear all
             </button>
             <Link href="/notifications" className="nb-viewall" onClick={() => setOpen(false)}>
               View all notifications

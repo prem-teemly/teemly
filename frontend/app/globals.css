@@ -9043,6 +9043,18 @@ button.st-switch:focus-visible {
   min-height: 0;
   overflow-y: auto;
 }
+/* "Clear all" next to "Mark all as read" (bell) and on the Notifications page: red, it removes. */
+.nb-foot .nb-readall.nb-clear {
+  margin-left: 0;
+  color: #c03636;
+}
+.nb-readall:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+.np-clear:not(:disabled) {
+  color: #c03636;
+}
 .nb-foot {
   display: flex;
   align-items: center;

@@ -1146,6 +1146,18 @@ route(
   }),
 );
 
+// "Clear all": the signed-in user's notifications are removed (they are not announced again).
+route(
+  "POST",
+  "/api/notifications/clear",
+  h(async (req, res) => {
+    peopleStore();
+    const cleared = await notesDb.clearAll();
+    repo.audit("notifications.cleared", { entityType: "notifications", entityId: "all", ip: clientIp(req), detail: { cleared } });
+    return sendJson(res, 200, { status: "success", cleared });
+  }),
+);
+
 // The bell was opened: its number goes to 0 (the rows stay unread until opened).
 route(
   "POST",

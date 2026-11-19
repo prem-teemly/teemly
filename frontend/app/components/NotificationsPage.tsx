@@ -3,7 +3,7 @@
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useCallback, useEffect, useState } from "react";
-import { NOTE_FILTERS, type Note, getNotes, markAllRead, markRead, markUnread } from "../lib/notifications";
+import { CLEAR_CONFIRM, NOTE_FILTERS, type Note, clearAllNotes, getNotes, markAllRead, markRead, markUnread } from "../lib/notifications";
 import FilterMenu from "./FilterMenu";
 import { SettingsIcon } from "./Icons";
 import { NoteGroups } from "./NotificationList";
@@ -73,6 +73,17 @@ export default function NotificationsPage() {
       void load(0);
     }
   }
+  async function clearAll() {
+    if (!window.confirm(CLEAR_CONFIRM)) return;
+    setItems([]);
+    setUnread(0);
+    setMore(false);
+    try {
+      await clearAllNotes();
+    } catch {
+      void load(0);
+    }
+  }
 
   return (
     <PeopleChrome active="">
@@ -85,6 +96,9 @@ export default function NotificationsPage() {
           <FilterMenu value={kind} onChange={setKind} options={NOTE_FILTERS.map((f, i) => ({ ...f, separatorBefore: i === 1 }))} label="Type" minWidth={170} />
           <button type="button" className="pl-view" onClick={() => void readAll()} disabled={!unread}>
             ✓✓ Mark all as read
+          </button>
+          <button type="button" className="pl-view np-clear" onClick={() => void clearAll()} disabled={!items?.length}>
+            Clear all
           </button>
           <Link href="/settings?tab=digest" className="pl-view" title="Notification settings">
             <SettingsIcon size={14} /> Settings
