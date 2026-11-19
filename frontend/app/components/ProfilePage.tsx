@@ -192,7 +192,7 @@ export default function ProfilePage() {
             <span className="pf-role">{user.role === "owner" ? "Owner" : "Member"}</span>
           </div>
           <p className="pf-facts">
-            <span>Email {user.email_masked}</span>
+            <span>Email {user.email ?? user.email_masked}</span>
             <span>Member since {dateLabel(user.member_since)}</span>
             <span>Last sign-in {user.last_login_at ? whenLabel(user.last_login_at) : "—"}</span>
           </p>

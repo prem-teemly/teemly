@@ -742,9 +742,7 @@ test("departments: the owner adds one; the AI sorts people and opportunities int
   assert.equal((await api("POST", `/api/people/${ids.Selvam}/opportunities`, { title: "Return pickups", department: "Logistics" })).status, 201);
   assert.equal((await api("POST", `/api/people/${ids.Selvam}/opportunities`, { title: "X", department: "Nowhere" })).status, 422);
 
-  // Built-in ones cannot be deleted; deleting Logistics takes it off people and opportunities.
-  const builtIn = r.body.departments.find((d) => d.name === "Investment");
-  assert.equal((await api("DELETE", `/api/departments/${builtIn.id}`)).status, 409);
+  // Deleting Logistics takes it off people and opportunities (built-in ones can be deleted too: tests/auth.test.js).
   assert.equal((await api("DELETE", `/api/departments/${logistics.id}`)).status, 200);
   const selvam = (await api("GET", `/api/people/${ids.Selvam}`)).body;
   assert.deepEqual(selvam.person.departments, []);

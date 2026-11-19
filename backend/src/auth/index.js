@@ -337,7 +337,8 @@ export function registerAuthRoutes(route) {
       const [info, sessions, room] = await Promise.all([store.userInfo(user.id), store.listSessions(user.id), runAs(user, () => roomStats()).catch(() => null)]);
       return sendJson(res, 200, {
         status: "success",
-        user: { ...publicUser(user), ...info },
+        // The signed-in user's own email in full (it is theirs; elsewhere it is shown masked).
+        user: { ...publicUser(user), email: user.email, ...info },
         room, // null when the people tables are not available
         sessions: sessions.map((s) => ({ id: s.id, device: deviceLabel(s.user_agent), signed_in_at: s.signed_in_at, last_seen_at: s.last_seen_at, expires_at: s.expires_at, current: s.id === user.sessionId })),
         security: { method: info?.has_password ? "Email + password, or email + one-time code" : "Email + one-time code", code_delivery: config.AUTH.otpProvider === "console" ? "console" : "email", session_days: config.AUTH.sessionDays, code_minutes: Math.round(config.AUTH.otpTtlSeconds / 60) },

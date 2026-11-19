@@ -188,13 +188,13 @@ export async function updateDepartment(id, data) {
   return row ? publicDepartment(row) : null;
 }
 
-/** Delete a department the owner added: it is taken off every person and opportunity. */
+/** Delete one of this room's departments (built-in or added): it is taken off every person and opportunity here. */
 export async function deleteDepartment(id) {
   const user = uid();
   const done = await withTransaction(async (conn) => {
     const [[d]] = await conn.execute("SELECT name, built_in FROM departments WHERE id = ? AND user_id = ? FOR UPDATE", [id, user]);
     if (!d) return false;
-    if (d.built_in) throw new WorkError(409, "Built-in departments cannot be deleted.");
+    // Built-in ones too: every account has its own copy of the eight, so this changes only this room.
     const strip = (col) => `${col} = TRIM(BOTH ',' FROM REPLACE(CONCAT(',', ${col}, ','), CONCAT(',', ?, ','), ','))`;
     await conn.execute(`UPDATE people SET ${strip("departments")} WHERE user_id = ? AND FIND_IN_SET(?, departments)`, [d.name, user, d.name]);
     await conn.execute(`UPDATE person_suggestions SET ${strip("departments")} WHERE user_id = ? AND FIND_IN_SET(?, departments)`, [d.name, user, d.name]);

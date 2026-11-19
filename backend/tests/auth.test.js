@@ -437,6 +437,14 @@ test("one room per account: people, opportunities, departments, calls, inbox, co
   assert.equal((await S.post("/api/notification-settings", { digest: false })).status, 200);
   assert.equal((await P.get("/api/notification-settings")).body.settings.digest, true, "settings are per account");
 
+  // A built-in department can be deleted: only from that account's room.
+  const sMarketing = (await S.get("/api/departments")).body.departments.find((d) => d.name === "Marketing");
+  assert.equal((await S.del(`/api/departments/${sMarketing.id}`)).status, 200);
+  assert.ok(!(await S.get("/api/departments")).body.departments.some((d) => d.name === "Marketing"));
+  assert.ok((await P.get("/api/departments")).body.departments.some((d) => d.name === "Marketing"), "Prem still has Marketing");
+  const pMarketing = (await P.get("/api/departments")).body.departments.find((d) => d.name === "Marketing");
+  assert.equal((await S.del(`/api/departments/${pMarketing.id}`)).status, 404, "and nobody can delete another account's department");
+
   // The legacy person is still Prem's alone.
   assert.equal((await S.get(`/api/people/${legacyPerson}`)).status, 404);
 });
@@ -497,7 +505,9 @@ test("profile: account, room counts and signed-in devices; the name can be chang
   const other = p.body.sessions.find((s) => !s.current);
   assert.ok(mine && other);
   assert.equal(other.device, "Safari on iPhone");
-  assert.doesNotMatch(JSON.stringify(p.body), /owner\.test@example\.com|token/i, "no full email or token in the profile");
+  assert.equal(p.body.user.email, "owner.test@example.com", "the signed-in user sees their own email in full");
+  assert.doesNotMatch(JSON.stringify(p.body), /token|password_hash|scrypt\$/i, "no token or password hash in the profile");
+  assert.ok(!JSON.stringify(await get("/api/auth/me", cookie)).includes("owner.test@example.com"), "elsewhere the email stays masked");
 
   // The name: validated, saved, shown everywhere.
   assert.equal((await json(await post("/api/auth/profile", { name: "x" }, { cookie }))).status, 422);

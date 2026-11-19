@@ -6,7 +6,7 @@ import { type Profile, getProfile } from "../lib/api";
 import { DEPT_VIEWS, type DeptView, createDepartment, deleteDepartment, guessView, updateDepartment, useDepartments } from "../lib/departments";
 import { type NotePrefs, PREF_LABELS, getNotePrefs, saveNotePrefs } from "../lib/notifications";
 import { type RoomSettings, getSettings } from "../lib/settings";
-import { DriveIcon, MailIcon, SparkleIcon } from "./Icons";
+import { DriveIcon, MailIcon, SparkleIcon, UsersIcon } from "./Icons";
 import PeopleChrome from "./PeopleChrome";
 
 // Settings: what is set up in this room, shown as it really is. Values come from the backend
@@ -60,13 +60,24 @@ function Card({ title, note, children, wide }: { title: string; note?: string; c
   );
 }
 
-function ConnectionsTab({ s, devices }: { s: RoomSettings; devices: number | null }) {
+function ConnectionsTab({ s, devices, profile }: { s: RoomSettings; devices: number | null; profile: Profile | null }) {
   const formats = s.upload.audio_formats.slice(0, 4).join(", ").toUpperCase();
+  const email = profile?.user.email ?? profile?.user.email_masked ?? null;
   return (
     <div className="st-grid">
       <Card title="Connections">
         <ul className="st-rows">
-          <Row icon={<MailIcon size={17} />} title="Gmail" sub="Read-only email sync for people in the room" right={<Status kind="soon">Coming soon</Status>} />
+          <Row
+            icon={<UsersIcon size={17} />}
+            title="Signed-in account"
+            sub={profile ? `${profile.user.name} · ${email}` : "Loading…"}
+            right={
+              <Link href="/profile" className="pa-btn pw-btn">
+                Profile
+              </Link>
+            }
+          />
+          <Row icon={<MailIcon size={17} />} title="Gmail" sub={`Read-only email sync for people in the room${email ? ` (${email})` : ""}`} right={<Status kind="soon">Coming soon</Status>} />
           <Row
             icon={<DriveIcon size={17} />}
             title="Call recordings"
@@ -178,7 +189,7 @@ function DepartmentsTab() {
   }
   async function remove(id: string, deptName: string, people: number) {
     if (busy) return;
-    if (!window.confirm(`Delete “${deptName}”? ${people ? `It is taken off ${people} ${people === 1 ? "person" : "people"} and their opportunities. ` : ""}People and opportunities themselves are kept.`)) return;
+    if (!window.confirm(`Delete “${deptName}”? ${people ? `It is taken off ${people} ${people === 1 ? "person" : "people"} and their opportunities. ` : ""}People and opportunities themselves are kept. The AI will no longer sort people into it.`)) return;
     setBusy(id);
     setError(null);
     try {
@@ -266,11 +277,9 @@ function DepartmentsTab() {
                   <button type="button" className="pw-link" disabled={!!busy || !loaded} onClick={() => setEditing({ id: d.id, color: d.color, description: d.description ?? "", view: d.view_type ?? "" })}>
                     Edit
                   </button>
-                  {!d.built_in && (
-                    <button type="button" className="pw-link pw-link-danger" disabled={!!busy} onClick={() => void remove(d.id, d.name, d.people)}>
-                      Delete
-                    </button>
-                  )}
+                  <button type="button" className="pw-link pw-link-danger" disabled={!!busy} onClick={() => void remove(d.id, d.name, d.people)}>
+                    Delete
+                  </button>
                 </span>
               </li>
             ),
@@ -485,7 +494,7 @@ export default function SettingsPage() {
           <span className="auth-spinner" />
         </div>
       ) : tab === "connections" ? (
-        <ConnectionsTab s={settings} devices={profile ? profile.sessions.length : null} />
+        <ConnectionsTab s={settings} devices={profile ? profile.sessions.length : null} profile={profile} />
       ) : tab === "departments" ? (
         <DepartmentsTab />
       ) : tab === "ai" ? (

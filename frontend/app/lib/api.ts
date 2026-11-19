@@ -467,7 +467,8 @@ export const updateMyName = (name: string) => authCall<{ user: AuthUser }>("/api
 
 export type DeviceSession = { id: number; device: string; signed_in_at: string; last_seen_at: string; expires_at: string; current: boolean };
 export type Profile = {
-  user: AuthUser & { member_since: string | null; last_login_at: string | null; has_password?: boolean; password_set_at?: string | null };
+  /** `email`: the signed-in user's own email in full (only on their profile). */
+  user: AuthUser & { email?: string | null; member_since: string | null; last_login_at: string | null; has_password?: boolean; password_set_at?: string | null };
   /** null when the people tables are not available. */
   room: { people: number; conversations: number; open_opportunities: number; open_value_inr: number; inbox_pending: number } | null;
   sessions: DeviceSession[];
