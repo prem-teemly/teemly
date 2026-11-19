@@ -23,8 +23,10 @@ const gemini = await import("../src/services/gemini.js");
 const transcription = await import("../src/services/transcription.js");
 const pipeline = await import("../src/services/pipeline.js");
 const db = await import("../src/db/pool.js");
-const repo = await import("../src/db/repository.js");
+const { asTestUser: asUser } = await import("./helpers/db-user.js");
+const repo = await asUser(await import("../src/db/repository.js")); // direct calls run as the test user
 const { migrate, listMigrations, splitStatements } = await import("../src/db/migrate.js");
+const { ensureTestUser } = await import("./helpers/db-user.js");
 
 const FIXTURES = path.join(path.dirname(fileURLToPath(import.meta.url)), "fixtures");
 const SR = transcription.SAMPLE_RATE;
@@ -121,6 +123,8 @@ const q = async (sql, params = []) => (await db.getPool().query(sql, params))[0]
 
 before(async () => {
   await resetTestSchema();
+  await migrate({ log: () => {} });
+  await ensureTestUser(db.getPool()); // every request runs as this user (tests/helpers/no-login.js)
   gemini.setClientForTests(fake);
   server = createApp().listen(0, "127.0.0.1");
   await new Promise((r) => server.once("listening", r));
@@ -160,8 +164,8 @@ test("migrations: create every table with utf8mb4, foreign keys and indexes; re-
   assert.ok(fks >= 14, `foreign keys: ${fks}`);
   const uniques = (await q("SELECT DISTINCT INDEX_NAME AS i FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = DATABASE() AND NON_UNIQUE = 0 AND INDEX_NAME <> 'PRIMARY' ORDER BY INDEX_NAME")).map((r) => r.i);
   assert.deepEqual(uniques, [
-    "uq_action_items_summary_seq", "uq_audio_files_stored_name", "uq_decisions_summary_seq", "uq_department_suggestions_job_name", "uq_departments_name", "uq_departments_slug", "uq_emotion_analysis_job",
-    "uq_follow_ups_summary_seq", "uq_notifications_dedupe", "uq_people_phone", "uq_person_mentions_person_job", "uq_person_suggestions_job_name", "uq_pulse_job_type_seq", "uq_segments_transcript_seq", "uq_sessions_token_hash", "uq_speakers_transcript_label",
+    "uq_action_items_summary_seq", "uq_audio_files_stored_name", "uq_decisions_summary_seq", "uq_department_suggestions_job_name", "uq_departments_user_name", "uq_departments_user_slug", "uq_emotion_analysis_job",
+    "uq_follow_ups_summary_seq", "uq_notifications_user_dedupe", "uq_people_user_phone", "uq_person_mentions_person_job", "uq_person_suggestions_job_name", "uq_pulse_job_type_seq", "uq_segments_transcript_seq", "uq_sessions_token_hash", "uq_speakers_transcript_label",
     "uq_summaries_job", "uq_transcripts_job", "uq_translations_segment_language", "uq_users_email", "uq_users_phone_hash",
   ]);
   const second = await migrate({ log: () => {} });
@@ -260,7 +264,7 @@ test("update: job progress and action item status", async () => {
 
 test("foreign keys: orphan rows are refused, referenced files cannot be deleted, results cascade", async () => {
   await assert.rejects(
-    () => db.getPool().execute("INSERT INTO processing_jobs (id, audio_file_id, kind) VALUES (?, ?, 'audio')", ["f".repeat(32), 999999999]),
+    () => db.getPool().execute("INSERT INTO processing_jobs (user_id, id, audio_file_id, kind) VALUES (1, ?, ?, 'audio')", ["f".repeat(32), 999999999]),
     (e) => /^ER_NO_REFERENCED_ROW(_2)?$/.test(e.code),
   );
   const [j] = await q("SELECT audio_file_id FROM processing_jobs WHERE id = ?", [audioJobId]);
@@ -283,7 +287,7 @@ test("transactions: a failure rolls back everything written in the transaction",
   const before = (await q("SELECT COUNT(*) AS n FROM audio_files"))[0].n;
   await assert.rejects(() =>
     db.withTransaction(async (conn) => {
-      await conn.execute("INSERT INTO audio_files (stored_name, original_name, kind, file_format, size_bytes, sha256) VALUES (?, 'x', 'audio', 'wav', 1, ?)", ["tx-test.wav", "0".repeat(64)]);
+      await conn.execute("INSERT INTO audio_files (user_id, stored_name, original_name, kind, file_format, size_bytes, sha256) VALUES (1, ?, 'x', 'audio', 'wav', 1, ?)", ["tx-test.wav", "0".repeat(64)]);
       throw new Error("boom");
     }),
   );
@@ -293,7 +297,7 @@ test("transactions: a failure rolls back everything written in the transaction",
   // partial transcript behind — and the API response is unaffected.
   const [j] = await q("SELECT audio_file_id FROM processing_jobs WHERE id = ?", [audioJobId]);
   const badId = "b".repeat(32);
-  await db.getPool().execute("INSERT INTO processing_jobs (id, audio_file_id, kind, status) VALUES (?, ?, 'audio', 'processing')", [badId, j.audio_file_id]);
+  await db.getPool().execute("INSERT INTO processing_jobs (user_id, id, audio_file_id, kind, status) VALUES (1, ?, ?, 'audio', 'processing')", [badId, j.audio_file_id]);
   const bad = structuredClone(audioResult);
   bad.tamil_segments[1].emotion = "x".repeat(50);
   await repo.saveJobOutcome({ id: badId, kind: "audio", status: "completed", stage: "done", progress: 1, error: null, result: bad, startedAt: Date.now() / 1000, finishedAt: Date.now() / 1000 });

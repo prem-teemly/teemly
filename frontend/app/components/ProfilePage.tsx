@@ -2,7 +2,7 @@
 
 import Link from "next/link";
 import { useCallback, useEffect, useState } from "react";
-import { type DeviceSession, type Profile, getProfile, revokeDevice, revokeOtherDevices } from "../lib/api";
+import { type DeviceSession, type Profile, getProfile, revokeDevice, revokeOtherDevices, setMyPassword, updateMyName } from "../lib/api";
 import { rupees, whenLabel } from "../lib/people";
 import { useAuth } from "./AuthGate";
 import PeopleChrome from "./PeopleChrome";
@@ -50,12 +50,17 @@ function Stat({ label, value, sub, href }: { label: string; value: string; sub?:
   );
 }
 
-/** The signed-in owner's profile: account, room at a glance, signed-in devices, sign-in & security. */
+/** The signed-in user's profile: account, room at a glance, signed-in devices, sign-in & security. */
 export default function ProfilePage() {
-  const { signOut } = useAuth();
+  const { signOut, refresh } = useAuth();
   const [p, setP] = useState<Profile | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [busy, setBusy] = useState<number | "others" | "signout" | null>(null);
+  const [busy, setBusy] = useState<number | "others" | "signout" | "name" | "password" | null>(null);
+  // Set / change password form (closed until asked for).
+  const [pwOpen, setPwOpen] = useState(false);
+  const [pwCurrent, setPwCurrent] = useState("");
+  const [pwNew, setPwNew] = useState("");
+  const [pwError, setPwError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
 
   const load = useCallback(async () => {
@@ -82,6 +87,43 @@ export default function ProfilePage() {
     } catch (e) {
       setNotice(message(e, "Could not sign out that device."));
       void load();
+    } finally {
+      setBusy(null);
+    }
+  }
+  /** Change the account's name (the room greets you with it; the AI knows you by it in calls). */
+  async function rename() {
+    if (busy || !p) return;
+    const next = window.prompt("Your name", p.user.name)?.replace(/\s+/g, " ").trim();
+    if (!next || next === p.user.name) return;
+    setBusy("name");
+    setNotice(null);
+    try {
+      const r = await updateMyName(next);
+      setP((x) => (x ? { ...x, user: { ...x.user, ...r.user } } : x));
+      void refresh(); // the sidebar and top bar show the new name
+      setNotice("Your name was changed.");
+    } catch (e) {
+      setNotice(message(e, "Could not change your name."));
+    } finally {
+      setBusy(null);
+    }
+  }
+  /** Set a first password or change it; every other device is signed out (this one stays). */
+  async function savePassword() {
+    if (busy || !p) return;
+    if ([...pwNew].length < 8) return setPwError("Use at least 8 characters.");
+    setBusy("password");
+    setPwError(null);
+    try {
+      const r = await setMyPassword(pwNew, p.user.has_password ? pwCurrent : null);
+      setPwOpen(false);
+      setPwCurrent("");
+      setPwNew("");
+      setNotice(`Password ${p.user.has_password ? "changed" : "set"}. You can now sign in with your email and password${r.signed_out ? `; ${r.signed_out} other device${r.signed_out === 1 ? " was" : "s were"} signed out` : ""}.`);
+      void load();
+    } catch (e) {
+      setPwError(message(e, "Could not save the password.").replace(/^password: /, ""));
     } finally {
       setBusy(null);
     }
@@ -154,7 +196,41 @@ export default function ProfilePage() {
             <span>Member since {dateLabel(user.member_since)}</span>
             <span>Last sign-in {user.last_login_at ? whenLabel(user.last_login_at) : "—"}</span>
           </p>
-          <p className="pf-hint">Your name and sign-in email are set on the server (OWNER_NAME and OWNER_EMAIL in backend/.env).</p>
+          <p className="pf-hint">
+            Only you can see the calls, people and deals in your room.{" "}
+            <button type="button" className="pw-link" disabled={busy !== null} onClick={() => void rename()}>
+              {busy === "name" ? "Saving…" : "Change name"}
+            </button>
+          </p>
+          <p className="pf-hint">
+            Password: {user.has_password ? `set${user.password_set_at ? ` on ${dateLabel(user.password_set_at)}` : ""}` : "not set (you sign in with an email code)"}.{" "}
+            <button type="button" className="pw-link" disabled={busy !== null} onClick={() => (setPwOpen((o) => !o), setPwError(null))}>
+              {user.has_password ? "Change password" : "Set a password"}
+            </button>
+          </p>
+          {pwOpen && (
+            <form
+              className="pf-password"
+              onSubmit={(e) => {
+                e.preventDefault();
+                void savePassword();
+              }}
+            >
+              {user.has_password && (
+                <input type="password" className="pf-input" autoComplete="current-password" placeholder="Current password" value={pwCurrent} onChange={(e) => setPwCurrent(e.target.value)} maxLength={128} />
+              )}
+              <input type="password" className="pf-input" autoComplete="new-password" placeholder="New password (at least 8 characters)" value={pwNew} onChange={(e) => setPwNew(e.target.value)} maxLength={128} />
+              <button type="submit" className="pa-btn pw-btn" disabled={busy !== null || !pwNew || (user.has_password && !pwCurrent)}>
+                {busy === "password" ? "Saving…" : "Save password"}
+              </button>
+              {pwError && (
+                <span className="pf-pw-error" role="alert">
+                  {pwError}
+                </span>
+              )}
+              <span className="pf-hint">Other devices will be signed out. Forgot it? Sign out and use “Forgot password?”.</span>
+            </form>
+          )}
         </div>
         <button type="button" className="pa-btn pf-signout" disabled={busy === "signout"} onClick={() => (setBusy("signout"), void signOut())}>
           {busy === "signout" ? "Signing out…" : "Sign out"}

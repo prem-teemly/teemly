@@ -3,12 +3,17 @@
 // Writes are best-effort: a database problem is logged and never changes an API response or stops
 // AI processing. A job's results are saved in one transaction (all or nothing) when it finishes, and
 // can be rebuilt in exactly the API's response shape after a backend restart.
+//
+// Files and jobs belong to the user who uploaded them (user_id, migration 023): reads by stored name
+// or job id return only the current user's rows. Housekeeping that is not about one user (restart
+// recovery, retention, the OCI migration tool) is marked "system" below.
 
 import { createHash, createHmac } from "node:crypto";
 import { createReadStream, statSync } from "node:fs";
 import path from "node:path";
 
 import { describeError, getPool, withTransaction } from "./pool.js";
+import { maybeUser, uid } from "../tenant.js";
 import { getLogger } from "../util.js";
 
 const logger = getLogger("app.db.repository");
@@ -38,9 +43,9 @@ async function safely(what, fn) {
 }
 
 /**
- * At startup: jobs left "queued" or "processing" by a previous run were lost with it (jobs run in this
- * process), so they are marked failed with a clear message instead of showing "processing" forever.
- * The bell then says the upload could not be analysed. Returns how many.
+ * System, at startup: jobs left "queued" or "processing" by a previous run were lost with it (jobs run
+ * in this process), so they are marked failed with a clear message instead of showing "processing"
+ * forever. Each owner's bell then says the upload could not be analysed. Returns how many.
  */
 export async function failInterruptedJobs(now = new Date()) {
   const r = await safely("interrupted jobs", () =>
@@ -74,11 +79,12 @@ const parseJson = (v) => (v === null || v === undefined ? null : typeof v === "s
 
 // ----------------------------------------------------------------------------- audit
 
-export function audit(event, { entityType = null, entityId = null, outcome = "success", ip = null, detail = null } = {}) {
+/** Record an event; `userId` defaults to the signed-in user (NULL = the system). */
+export function audit(event, { entityType = null, entityId = null, outcome = "success", ip = null, detail = null, userId = maybeUser()?.id ?? null } = {}) {
   return safely(`audit (${event})`, () =>
     getPool().execute(
-      "INSERT INTO audit_logs (event, entity_type, entity_id, outcome, client_hash, detail) VALUES (?, ?, ?, ?, ?, ?)",
-      [event, entityType, entityId, outcome, clientHash(ip), json(detail)],
+      "INSERT INTO audit_logs (user_id, event, entity_type, entity_id, outcome, client_hash, detail) VALUES (?, ?, ?, ?, ?, ?, ?)",
+      [userId, event, entityType, entityId, outcome, clientHash(ip), json(detail)],
     ),
   );
 }
@@ -104,23 +110,23 @@ export function resetSchemaCacheForTests() {
   metadataColumns = null;
 }
 
-/** Insert an audio_files row with every metadata field the schema supports. */
+/** Insert an audio_files row (owned by the current user) with every metadata field the schema supports. */
 async function insertFile(conn, { storedName, originalName, kind, format, sizeBytes, sha, meta, uploadedAt = new Date(), storage = null }) {
   // created_at = the exact upload instant the API reported (FROM_UNIXTIME uses the session time zone,
   // like the column default, so UNIX_TIMESTAMP(created_at) reads it back exactly).
-  const base = [storedName, originalName.slice(0, 255), kind, format, sizeBytes, sha, meta?.duration_seconds ?? null, uploadedAt.getTime() / 1000];
+  const base = [uid(), storedName, originalName.slice(0, 255), kind, format, sizeBytes, sha, meta?.duration_seconds ?? null, uploadedAt.getTime() / 1000];
   if (!(await hasMetadataColumns(conn))) {
     const [r] = await conn.execute(
-      "INSERT INTO audio_files (stored_name, original_name, kind, file_format, size_bytes, sha256, duration_seconds, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, FROM_UNIXTIME(?))",
+      "INSERT INTO audio_files (user_id, stored_name, original_name, kind, file_format, size_bytes, sha256, duration_seconds, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, FROM_UNIXTIME(?))",
       base,
     );
     return r.insertId;
   }
   const [r] = await conn.execute(
-    `INSERT INTO audio_files (stored_name, original_name, kind, file_format, size_bytes, sha256, duration_seconds, created_at,
+    `INSERT INTO audio_files (user_id, stored_name, original_name, kind, file_format, size_bytes, sha256, duration_seconds, created_at,
        mime_type, container_format, audio_codec, sample_rate_hz, channels, bitrate_bps,
        storage_provider, storage_path, metadata_status, metadata_error)
-     VALUES (?, ?, ?, ?, ?, ?, ?, FROM_UNIXTIME(?), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, FROM_UNIXTIME(?), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     [...base, meta?.mime_type ?? null, meta?.container_format ?? null, meta?.audio_codec ?? null, meta?.sample_rate_hz ?? null,
       meta?.channels ?? null, meta?.bitrate_bps ?? null, storage?.provider ?? "local", storage?.path ?? `uploads/${storedName}`,
       meta?.status ?? null, meta?.error ?? null],
@@ -129,34 +135,37 @@ async function insertFile(conn, { storedName, originalName, kind, format, sizeBy
 }
 
 /**
- * Record an accepted upload (file + upload event) in one transaction. `sha` is the SHA-256 of the
- * file as stored on disk; `meta` is the ffprobe measurement (mediaProbe.probe), or null for chats.
- */
-/**
- * An earlier upload of exactly these bytes (same SHA-256) that was analysed or is being analysed, or
- * null. A failed analysis does not count (that file may be uploaded again). Null without MySQL.
+ * An earlier upload by the current user of exactly these bytes (same SHA-256) that was analysed or is
+ * being analysed, or null. A failed analysis does not count (that file may be uploaded again), nor does
+ * another account's copy. Null without MySQL.
  */
 export async function analysedCopy(sha, kind = "audio") {
   if (!enabled()) return null;
   const [[r]] = await getPool().query(
     `SELECT f.original_name, f.created_at, j.id AS job_id, j.status
        FROM audio_files f JOIN processing_jobs j ON j.audio_file_id = f.id
-      WHERE f.sha256 = ? AND f.kind = ? AND f.deleted_at IS NULL AND j.status <> 'failed'
+      WHERE f.user_id = ? AND f.sha256 = ? AND f.kind = ? AND f.deleted_at IS NULL AND j.status <> 'failed'
       ORDER BY f.id DESC LIMIT 1`,
-    [sha, kind],
+    [uid(), sha, kind],
   );
   if (!r) return null;
   const at = r.created_at instanceof Date ? r.created_at.toISOString() : new Date(r.created_at).toISOString();
   return { job_id: r.job_id, original_name: r.original_name, uploaded_at: at, status: r.status };
 }
 
+/**
+ * Record an accepted upload (file + upload event) in one transaction. `sha` is the SHA-256 of the
+ * file as stored on disk; `meta` is the ffprobe measurement (mediaProbe.probe), or null for chats.
+ */
 export function recordUpload({ kind, storedName, originalName, format, data, sha = null, meta = null, uploadedAt = new Date(), storage = null, ip }) {
+  if (!enabled()) return Promise.resolve(null);
+  const user = uid(); // outside safely(): an upload with no signed-in user is a bug, not a database problem
   return safely("upload record", async () => {
     const fileId = await withTransaction(async (conn) => {
       const file = { insertId: await insertFile(conn, { storedName, originalName, kind, format, sizeBytes: data.length, sha: sha ?? sha256(data), meta, uploadedAt, storage }) };
       await conn.execute(
-        "INSERT INTO audio_uploads (audio_file_id, kind, original_name, size_bytes, status, http_status, client_hash) VALUES (?, ?, ?, ?, 'accepted', 201, ?)",
-        [file.insertId, kind, originalName.slice(0, 255), data.length, clientHash(ip)],
+        "INSERT INTO audio_uploads (user_id, audio_file_id, kind, original_name, size_bytes, status, http_status, client_hash) VALUES (?, ?, ?, ?, ?, 'accepted', 201, ?)",
+        [user, file.insertId, kind, originalName.slice(0, 255), data.length, clientHash(ip)],
       );
       return file.insertId;
     });
@@ -167,16 +176,18 @@ export function recordUpload({ kind, storedName, originalName, format, data, sha
 
 /** Record a rejected upload attempt (no file is stored). */
 export function recordRejectedUpload({ kind, originalName, sizeBytes, httpStatus, message, ip }) {
+  if (!enabled()) return Promise.resolve(null);
+  const user = uid();
   return safely("rejected upload record", async () => {
     await getPool().execute(
-      "INSERT INTO audio_uploads (audio_file_id, kind, original_name, size_bytes, status, http_status, error_message, client_hash) VALUES (NULL, ?, ?, ?, 'rejected', ?, ?, ?)",
-      [kind, originalName ? originalName.slice(0, 255) : null, sizeBytes ?? null, httpStatus, String(message).slice(0, 500), clientHash(ip)],
+      "INSERT INTO audio_uploads (user_id, audio_file_id, kind, original_name, size_bytes, status, http_status, error_message, client_hash) VALUES (?, NULL, ?, ?, ?, 'rejected', ?, ?, ?)",
+      [user, kind, originalName ? originalName.slice(0, 255) : null, sizeBytes ?? null, httpStatus, String(message).slice(0, 500), clientHash(ip)],
     );
     await audit("upload.rejected", { outcome: "failure", ip, detail: { kind, http_status: httpStatus } });
   });
 }
 
-/** Mark files removed by the retention policy (rows are kept; nothing is deleted). */
+/** System: mark files removed by the retention policy (rows are kept; nothing is deleted). */
 export function markFilesDeleted(storedNames) {
   if (!storedNames.length) return Promise.resolve(null);
   return safely("retention update", async () => {
@@ -189,18 +200,32 @@ export function markFilesDeleted(storedNames) {
 
 // ---------------------------------------------------------------------------- storage
 
-/** Where a stored file's original is: { storage_provider, storage_path, sha256 } (null if unknown). */
+/** Where one of the current user's stored files is: { storage_provider, storage_path, sha256 } (null if unknown). */
 export function fileStorage(storedName) {
+  if (!enabled()) return Promise.resolve(null);
+  const user = uid();
   return safely("file storage", async () => {
     const db = getPool();
     const cols = (await hasMetadataColumns(db)) ? "storage_provider, storage_path, sha256" : "'local' AS storage_provider, NULL AS storage_path, sha256";
-    const [[row]] = await db.execute(`SELECT ${cols} FROM audio_files WHERE stored_name = ?`, [storedName]);
+    const [[row]] = await db.execute(`SELECT ${cols} FROM audio_files WHERE stored_name = ? AND user_id = ?`, [storedName, user]);
     return row ?? null;
   });
 }
 
 /**
- * Local audio files still to move to OCI (migration utility), in id order after `afterId`.
+ * Who uploaded a stored file: true = the current user, false = someone else, null = not recorded
+ * (no database, or a file from before persistence). Throws when the database cannot answer, so an
+ * unknown owner is never treated as "yours".
+ */
+export async function ownsFile(storedName) {
+  if (!enabled()) return null;
+  const [[row]] = await getPool().execute("SELECT user_id FROM audio_files WHERE stored_name = ?", [storedName]);
+  if (!row) return null;
+  return Number(row.user_id) === uid();
+}
+
+/**
+ * System (OCI migration tool): local audio files still to move to OCI, in id order after `afterId`.
  * Throws if the storage columns (migration 002) are missing: the migration needs them.
  */
 export async function localAudioBatch({ afterId = 0, limit = 20 } = {}) {
@@ -217,7 +242,7 @@ export async function localAudioBatch({ afterId = 0, limit = 20 } = {}) {
   return rows;
 }
 
-/** Record that a file's original is now in OCI (only after the upload was verified). */
+/** System (OCI migration tool): record that a file's original is now in OCI (only after the upload was verified). */
 export async function setStorage(id, { provider, path: storagePath, expectedSha }) {
   const [r] = await getPool().execute(
     "UPDATE audio_files SET storage_provider = ?, storage_path = ? WHERE id = ? AND sha256 = ? AND (storage_provider IS NULL OR storage_provider = 'local')",
@@ -228,9 +253,12 @@ export async function setStorage(id, { provider, path: storagePath, expectedSha 
 
 // ------------------------------------------------------------------------------- jobs
 
-/** The audio_files row for a stored name; files uploaded before persistence existed are registered. */
+/**
+ * The current user's audio_files row for a stored name; files uploaded before persistence existed are
+ * registered to them (the route has already checked nobody else owns the name).
+ */
 async function fileIdFor(conn, storedName, filePath, kind, meta) {
-  const [rows] = await conn.execute("SELECT id FROM audio_files WHERE stored_name = ?", [storedName]);
+  const [rows] = await conn.execute("SELECT id FROM audio_files WHERE stored_name = ? AND user_id = ?", [storedName, uid()]);
   if (rows.length) return rows[0].id;
   return insertFile(conn, {
     storedName, originalName: storedName, kind, format: path.extname(storedName).slice(1),
@@ -238,16 +266,20 @@ async function fileIdFor(conn, storedName, filePath, kind, meta) {
   });
 }
 
-/** SHA-256 recorded for a stored file at upload (null if unknown or the database is off). */
+/** SHA-256 recorded for one of the current user's stored files at upload (null if unknown or the database is off). */
 export function recordedSha(storedName) {
+  if (!enabled()) return Promise.resolve(null);
+  const user = uid();
   return safely("file checksum", async () => {
-    const [[row]] = await getPool().execute("SELECT sha256 FROM audio_files WHERE stored_name = ?", [storedName]);
+    const [[row]] = await getPool().execute("SELECT sha256 FROM audio_files WHERE stored_name = ? AND user_id = ?", [storedName, user]);
     return row?.sha256 ?? null;
   });
 }
 
-/** Persisted metadata of a stored file, in the API's `audio` shape (null if unknown). */
+/** Persisted metadata of one of the current user's stored files, in the API's `audio` shape (null if unknown). */
 export function fileMetadata(storedName) {
+  if (!enabled()) return Promise.resolve(null);
+  const user = uid();
   return safely("file metadata", async () => {
     const db = getPool();
     const extra = (await hasMetadataColumns(db))
@@ -255,8 +287,8 @@ export function fileMetadata(storedName) {
       : "";
     const [[f]] = await db.execute(
       `SELECT f.original_name, f.file_format, f.size_bytes, f.duration_seconds, UNIX_TIMESTAMP(f.created_at) AS uploaded_epoch${extra}
-         FROM audio_files f WHERE f.stored_name = ?`,
-      [storedName],
+         FROM audio_files f WHERE f.stored_name = ? AND f.user_id = ?`,
+      [storedName, user],
     );
     return f ? publicAudio(f) : null;
   });
@@ -282,39 +314,48 @@ export function publicAudio(f) {
   };
 }
 
+/** Store a new job for its owner (job.owner, the user who started it). */
 export function createJob(job, filePath, ip) {
+  if (!enabled()) return Promise.resolve(null);
+  const user = uid();
   return safely("job create", async () => {
     await withTransaction(async (conn) => {
       const fileId = await fileIdFor(conn, job.filename, filePath, job.kind, job.probe ?? null);
       await conn.execute(
-        "INSERT INTO processing_jobs (id, audio_file_id, kind, status, stage, progress, num_speakers) VALUES (?, ?, ?, ?, ?, ?, ?)",
-        [job.id, fileId, job.kind, job.status, job.stage, job.progress, job.numSpeakers ?? null],
+        "INSERT INTO processing_jobs (id, user_id, audio_file_id, kind, status, stage, progress, num_speakers) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        [job.id, user, fileId, job.kind, job.status, job.stage, job.progress, job.numSpeakers ?? null],
       );
     });
     await audit("job.created", { entityType: "processing_job", entityId: job.id, ip, detail: { kind: job.kind } });
   });
 }
 
-/** Status / stage / progress of a running job (called on stage changes). */
+/** Status / stage / progress of a running job (called on stage changes, as the job's owner). */
 export function updateJobProgress(job) {
+  if (!enabled()) return Promise.resolve(null);
+  const user = uid();
   return safely("job progress", () =>
     getPool().execute(
-      "UPDATE processing_jobs SET status = ?, stage = ?, progress = ?, started_at = COALESCE(started_at, ?) WHERE id = ?",
-      [job.status, job.stage, job.progress, toDate(job.startedAt), job.id],
+      "UPDATE processing_jobs SET status = ?, stage = ?, progress = ?, started_at = COALESCE(started_at, ?) WHERE id = ? AND user_id = ?",
+      [job.status, job.stage, job.progress, toDate(job.startedAt), job.id, user],
     ),
   );
 }
 
 /** Save a finished job: status, and for completed jobs every result table, in one transaction. */
 export function saveJobOutcome(job, models = {}) {
+  if (!enabled()) return Promise.resolve(null);
+  const user = uid();
   return safely("job result", async () => {
     await withTransaction(async (conn) => {
+      const [[mine]] = await conn.execute("SELECT 1 AS ok FROM processing_jobs WHERE id = ? AND user_id = ? FOR UPDATE", [job.id, user]);
+      if (!mine) return; // not this user's job (or never stored): nothing is written
       await conn.execute(
         `UPDATE processing_jobs SET status = ?, stage = ?, progress = ?, error_message = ?, transcription_model = ?,
-           text_model = ?, timings = ?, started_at = ?, finished_at = ? WHERE id = ?`,
+           text_model = ?, timings = ?, started_at = ?, finished_at = ? WHERE id = ? AND user_id = ?`,
         [job.status, job.stage, job.progress, job.error ? String(job.error).slice(0, 1000) : null,
           job.result?.transcription_model ?? models.transcription ?? null, models.text ?? null,
-          json(job.result?.timings_seconds ?? null), toDate(job.startedAt), toDate(job.finishedAt), job.id],
+          json(job.result?.timings_seconds ?? null), toDate(job.startedAt), toDate(job.finishedAt), job.id, user],
       );
       if (job.status === "completed" && job.result) await saveResult(conn, job);
     });
@@ -436,18 +477,20 @@ async function saveResult(conn, job) {
 
   if (!chat) {
     // Keep the duration measured at upload (ffprobe); fill it only if it was not available.
-    await conn.execute("UPDATE audio_files f JOIN processing_jobs j ON j.audio_file_id = f.id SET f.duration_seconds = COALESCE(f.duration_seconds, ?) WHERE j.id = ?",
-      [r.audio_duration_seconds, job.id]);
+    await conn.execute("UPDATE audio_files f JOIN processing_jobs j ON j.audio_file_id = f.id SET f.duration_seconds = COALESCE(f.duration_seconds, ?) WHERE j.id = ? AND j.user_id = ?",
+      [r.audio_duration_seconds, job.id, uid()]);
   }
 }
 
 // ------------------------------------------------------------------------------ exports
 
 export function recordExport({ jobId, title, pdf, ip }) {
+  if (!enabled()) return Promise.resolve(null);
+  const user = uid();
   return safely("export record", async () => {
     const [ins] = await getPool().execute(
-      "INSERT INTO exports (job_id, format, title, size_bytes, sha256, client_hash) VALUES (?, 'pdf', ?, ?, ?, ?)",
-      [jobId, title.slice(0, 200), pdf.length, sha256(pdf), clientHash(ip)],
+      "INSERT INTO exports (user_id, job_id, format, title, size_bytes, sha256, client_hash) VALUES (?, ?, 'pdf', ?, ?, ?, ?)",
+      [user, jobId, title.slice(0, 200), pdf.length, sha256(pdf), clientHash(ip)],
     );
     await audit("export.created", { entityType: "processing_job", entityId: jobId, ip, detail: { format: "pdf", size_bytes: pdf.length } });
     return ins.insertId;
@@ -460,15 +503,17 @@ const num = (v) => (v === null || v === undefined ? null : Number(v));
 const iso = (d) => (d instanceof Date ? d.toISOString().slice(0, 19) : String(d).replace(" ", "T").slice(0, 19));
 
 /**
- * Rebuild a job from the database in the API's response shape (after a backend restart).
- * Returns null when the job is unknown or the database is unavailable.
+ * Rebuild one of the current user's jobs from the database in the API's response shape (after a
+ * backend restart). Returns null when the job is unknown, another user's, or the database is unavailable.
  */
 export function loadJob(jobId) {
+  if (!enabled()) return Promise.resolve(null);
+  const user = uid();
   return safely("job load", async () => {
     const db = getPool();
     const [[j]] = await db.execute(
-      "SELECT j.*, f.stored_name FROM processing_jobs j JOIN audio_files f ON f.id = j.audio_file_id WHERE j.id = ?",
-      [jobId],
+      "SELECT j.*, f.stored_name FROM processing_jobs j JOIN audio_files f ON f.id = j.audio_file_id WHERE j.id = ? AND j.user_id = ?",
+      [jobId, user],
     );
     if (!j) return null;
     const audio = j.kind === "audio" ? await fileMetadata(j.stored_name) : null;

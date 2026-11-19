@@ -11,6 +11,7 @@ import { z } from "zod";
 import * as config from "../config.js";
 import * as gemini from "./gemini.js";
 import { norm } from "./pulse.js";
+import { ownerName as currentOwnerName } from "../tenant.js";
 import { getLogger } from "../util.js";
 
 const logger = getLogger("app.services.insight");
@@ -74,7 +75,7 @@ function formatLine(l) {
  * { name, role_title, organisation, city }; `conversations`: [{ job_id, label, lines: [{ id, speaker,
  * time_label, original, english, start }] }] (oldest first). Returns the validated insight.
  */
-export async function analyzeOpportunity(deal, person, conversations, ownerName = config.AUTH.ownerName) {
+export async function analyzeOpportunity(deal, person, conversations, ownerName = currentOwnerName()) {
   const lines = [];
   conversations.forEach((c, ci) => {
     for (const l of c.lines) lines.push({ ...l, gid: (ci + 1) * 1000 + l.id, job_id: c.job_id, when: `${c.label}${l.time_label ? ` ${l.time_label}` : ""}` });

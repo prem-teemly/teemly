@@ -4,11 +4,20 @@ import { useRouter } from "next/navigation";
 import { useEffect, useRef, useState } from "react";
 import { safeNext, useAuth } from "../components/AuthGate";
 import { ShareIcon } from "../components/Icons";
-import { AuthError, type OtpRequest, requestOtp, verifyOtp } from "../lib/api";
+import { AuthError, type AuthIntent, type OtpRequest, passwordLogin, requestOtp, verifyOtp } from "../lib/api";
 
 const LEN = 6;
+const MIN_PASSWORD = 8;
 const digitsOnly = (s: string) => s.replace(/\D/g, "");
 const validEmail = (e: string) => /^[^\s@<>"]{1,64}@[^\s@<>"]+\.[a-z]{2,}$/i.test(e.trim());
+/** A name for a new account: 2-80 characters with a letter (the backend checks the same). */
+const cleanName = (n: string) => n.replace(/\s+/g, " ").trim();
+const validName = (n: string) => {
+  const c = cleanName(n);
+  return [...c].length >= 2 && [...c].length <= 80 && /\p{L}/u.test(c) && !/[<>"]/.test(c);
+};
+/** Length only here; the backend also refuses common passwords and ones made of the email. */
+const okPassword = (p: string) => [...p].length >= MIN_PASSWORD && [...p].length <= 128;
 /** "ownername.sample@gmail.com" -> "own•••••••••••••@gmail.com" (as the backend shows it). */
 const masked = (e: string) => {
   const [local = "", domain = ""] = e.trim().toLowerCase().split("@");
@@ -24,16 +33,50 @@ function ShieldIcon() {
   );
 }
 
+/** How the "Sign in" tab signs in: with the password, or with a code emailed (also "Forgot password"). */
+type SignInWay = "password" | "code" | "reset";
+
+/**
+ * Sign in or create an account.
+ *
+ * Sign in: email + password (fast), or "Email me a code" (always works, even without a password), or
+ * "Forgot password?" (a code, then a new password). Create account: name, email and a password, then
+ * the code sent to the email proves it is yours. Signing in by code with an email that has no account
+ * asks for the name, then creates the account with the same code. Afterwards the room opens on Today
+ * (or the page you came from).
+ */
 export default function LoginPage() {
   const router = useRouter();
   const { auth, refresh } = useAuth();
+  const [mode, setMode] = useState<"signin" | "signup">("signin");
+  const [way, setWay] = useState<SignInWay>("password");
+  const [name, setName] = useState("");
   const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
+  const [showPassword, setShowPassword] = useState(false);
   const [challenge, setChallenge] = useState<OtpRequest | null>(null);
+  const [needName, setNeedName] = useState(false); // signing in by code, but this email has no account yet
   const [code, setCode] = useState<string[]>(Array(LEN).fill(""));
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [exists, setExists] = useState(false); // "Create account" with an email that already has one
   const [resendIn, setResendIn] = useState(0);
   const boxes = useRef<(HTMLInputElement | null)[]>([]);
+  const nameBox = useRef<HTMLInputElement | null>(null);
+  const passwordBox = useRef<HTMLInputElement | null>(null);
+
+  const signupOpen = auth?.signup?.enabled !== false;
+  const intent: AuthIntent = mode === "signup" ? "signup" : way === "reset" ? "reset" : "signin";
+  const askingName = mode === "signup" || needName;
+  // A password goes with the code when creating an account, or as the new one after "Forgot password".
+  const sendsPassword = mode === "signup" || (mode === "signin" && way === "reset");
+
+  // ?mode=signup opens "Create account" (e.g. a link shared with a teammate).
+  useEffect(() => {
+    const wanted = new URLSearchParams(window.location.search).get("mode");
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- reading the URL once on load
+    if (wanted === "signup") setMode("signup");
+  }, []);
 
   // Resend countdown.
   useEffect(() => {
@@ -42,37 +85,100 @@ export default function LoginPage() {
     return () => clearTimeout(t);
   }, [resendIn]);
 
-  async function send() {
-    if (!validEmail(email) || busy) return;
+  function reset(next: { mode?: "signin" | "signup"; way?: SignInWay }) {
+    if (next.mode) setMode(next.mode);
+    if (next.way) setWay(next.way);
+    setError(null);
+    setExists(false);
+    setNeedName(false);
+    setChallenge(null);
+    setPassword("");
+  }
+
+  async function done() {
+    await refresh();
+    router.replace(safeNext());
+  }
+
+  // --- Step 1 -----------------------------------------------------------------------------------------
+  const passwordStep = mode === "signin" && way === "password";
+  const canSubmit =
+    !busy &&
+    validEmail(email) &&
+    (passwordStep ? password.length > 0 : mode === "signup" ? validName(name) && okPassword(password) : true);
+
+  async function signInWithPassword() {
     setBusy(true);
     setError(null);
     try {
-      const r = await requestOtp(email.trim());
+      await passwordLogin(email.trim(), password);
+      await done();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Could not sign in.");
+      setPassword("");
+      setTimeout(() => passwordBox.current?.focus(), 0);
+      setBusy(false);
+    }
+  }
+
+  async function send() {
+    if (!canSubmit && !challenge) return;
+    setBusy(true);
+    setError(null);
+    try {
+      const r = await requestOtp(email.trim(), intent, mode === "signup" ? cleanName(name) : null);
       setChallenge(r);
+      setNeedName(false);
       setCode(Array(LEN).fill(""));
       setResendIn(r.resend_in);
-      setTimeout(() => boxes.current[0]?.focus(), 0);
+      setTimeout(() => (way === "reset" && mode === "signin" ? passwordBox.current : boxes.current[0])?.focus(), 0);
     } catch (e) {
       if (e instanceof AuthError && e.retryAfter && challenge) setResendIn(e.retryAfter);
+      setExists(e instanceof AuthError && e.code === "account_exists");
       setError(e instanceof Error ? e.message : "Could not send the code.");
     } finally {
       setBusy(false);
     }
   }
 
+  // --- Step 2: the code ---------------------------------------------------------------------------------
+  const codeReady = (value: string) => value.length === LEN && (!askingName || validName(name)) && (!sendsPassword || okPassword(password));
+
   async function verify(value = code.join("")) {
     if (!challenge || value.length !== LEN || busy) return;
+    if (askingName && !validName(name)) {
+      setError("Enter your name (at least 2 letters) to create your account.");
+      nameBox.current?.focus();
+      return;
+    }
+    if (sendsPassword && !okPassword(password)) {
+      setError(`Choose a password of at least ${MIN_PASSWORD} characters.`);
+      passwordBox.current?.focus();
+      return;
+    }
     setBusy(true);
     setError(null);
     try {
-      await verifyOtp(challenge.challenge_id, value);
-      await refresh();
-      router.replace(safeNext());
+      await verifyOtp(challenge.challenge_id, value, email.trim(), askingName ? cleanName(name) : null, sendsPassword ? password : null);
+      await done();
     } catch (e) {
-      setError(e instanceof Error ? e.message : "Could not verify the code.");
-      setCode(Array(LEN).fill(""));
-      setTimeout(() => boxes.current[0]?.focus(), 0);
       setBusy(false);
+      if (e instanceof AuthError && e.code === "name_required") {
+        // The code is right and still valid: this email is new. Ask for the name, keep the code.
+        setNeedName(true);
+        setTimeout(() => nameBox.current?.focus(), 0);
+        return;
+      }
+      setError(e instanceof Error ? e.message : "Could not verify the code.");
+      if (e instanceof AuthError && e.code === "weak_password") {
+        // The code was not used: choose another password and send the same code again.
+        setTimeout(() => passwordBox.current?.focus(), 0);
+        return;
+      }
+      if (!(e instanceof AuthError && e.code === "signup_closed")) {
+        setCode(Array(LEN).fill(""));
+        setTimeout(() => boxes.current[0]?.focus(), 0);
+      }
     }
   }
 
@@ -84,14 +190,14 @@ export default function LoginPage() {
       const full = [...next, ...Array(LEN - next.length).fill("")];
       setCode(full);
       boxes.current[Math.min(next.length, LEN - 1)]?.focus();
-      if (next.length === LEN) void verify(next.join(""));
+      if (codeReady(next.join(""))) void verify(next.join(""));
       return;
     }
     const next = [...code];
     next[i] = d;
     setCode(next);
     if (d && i < LEN - 1) boxes.current[i + 1]?.focus();
-    if (d && next.every(Boolean)) void verify(next.join(""));
+    if (d && next.every(Boolean) && codeReady(next.join(""))) void verify(next.join(""));
   }
 
   function onKey(i: number, e: React.KeyboardEvent<HTMLInputElement>) {
@@ -101,7 +207,69 @@ export default function LoginPage() {
     else if (e.key === "Enter") void verify();
   }
 
-  const loginOff = auth && !auth.auth_enabled;
+  // --- Fields -------------------------------------------------------------------------------------------
+  const nameField = (
+    <div className="login-field">
+      <label className="login-label" htmlFor="name">
+        Your name
+      </label>
+      <div className="login-phone">
+        <input
+          id="name"
+          ref={nameBox}
+          className="login-text"
+          type="text"
+          autoComplete="name"
+          maxLength={80}
+          placeholder="e.g. Prem Kumar"
+          value={name}
+          onChange={(e) => {
+            setName(e.target.value);
+            setError(null);
+          }}
+        />
+      </div>
+    </div>
+  );
+
+  const passwordField = (label: string, isNew: boolean) => (
+    <div className="login-field">
+      <label className="login-label" htmlFor="password">
+        {label}
+      </label>
+      <div className="login-phone">
+        <input
+          id="password"
+          ref={passwordBox}
+          className="login-text"
+          type={showPassword ? "text" : "password"}
+          autoComplete={isNew ? "new-password" : "current-password"}
+          maxLength={128}
+          placeholder={isNew ? `At least ${MIN_PASSWORD} characters` : "Your password"}
+          value={password}
+          onChange={(e) => {
+            setPassword(e.target.value);
+            setError(null);
+          }}
+        />
+        <button type="button" className="login-show" onClick={() => setShowPassword((s) => !s)} aria-label={showPassword ? "Hide password" : "Show password"}>
+          {showPassword ? "Hide" : "Show"}
+        </button>
+      </div>
+      {isNew && <p className="login-hint">Not a common password, and not your email.</p>}
+    </div>
+  );
+
+  const title =
+    mode === "signup" ? "Create your room" : way === "reset" ? "Reset your password" : "Sign in to your room";
+  const sub =
+    mode === "signup"
+      ? "Your calls, people and deals stay private to you. We'll email you a code to confirm it's your email."
+      : way === "password"
+        ? "Sign in with your email and password."
+        : way === "reset"
+          ? "We'll email you a code, then you choose a new password."
+          : "We'll email you a one-time code.";
 
   return (
     <div className="login-page">
@@ -116,7 +284,7 @@ export default function LoginPage() {
           <br />
           Every opportunity.
           <br />
-          One private room.
+          Your own private room.
         </p>
         <p className="login-brand-foot">Private · Encrypted · Only you</p>
       </aside>
@@ -127,58 +295,108 @@ export default function LoginPage() {
             <ShareIcon size={20} strokeWidth={2} />
           </span>
 
-          {loginOff ? (
-            <>
-              <h1 className="login-title">Sign-in is not enabled</h1>
-              <p className="login-sub">
-                Add <code>OWNER_EMAIL</code> (and <code>OWNER_NAME</code>) to <code>backend/.env</code> and restart the backend to require sign-in.
-              </p>
-              <button type="button" className="login-btn" onClick={() => router.replace("/people")}>
-                Continue to People
-              </button>
-            </>
-          ) : !challenge ? (
+          {!challenge ? (
             <form
               onSubmit={(e) => {
                 e.preventDefault();
-                void send();
+                if (!canSubmit) return;
+                void (passwordStep ? signInWithPassword() : send());
               }}
             >
-              <h1 className="login-title">Sign in to your room</h1>
-              <p className="login-sub">We&apos;ll email you a one-time code.</p>
-              <label className="login-label" htmlFor="email">
-                Email
-              </label>
-              <div className={`login-phone ${error ? "login-phone-err" : ""}`}>
-                <input
-                  id="email"
-                  type="email"
-                  inputMode="email"
-                  autoComplete="email"
-                  autoCapitalize="none"
-                  spellCheck={false}
-                  maxLength={254}
-                  placeholder="you@example.com"
-                  value={email}
-                  onChange={(e) => {
-                    setEmail(e.target.value.replace(/\s+/g, ""));
-                    setError(null);
-                  }}
-                  aria-invalid={!!error}
-                  aria-describedby={error ? "login-error" : undefined}
-                  autoFocus
-                />
+              {signupOpen && (
+                <div className="login-tabs" role="tablist" aria-label="Sign in or create an account">
+                  <button type="button" role="tab" className="login-tab" aria-selected={mode === "signin"} onClick={() => mode !== "signin" && reset({ mode: "signin", way: "password" })}>
+                    Sign in
+                  </button>
+                  <button type="button" role="tab" className="login-tab" aria-selected={mode === "signup"} onClick={() => mode !== "signup" && reset({ mode: "signup" })}>
+                    Create account
+                  </button>
+                </div>
+              )}
+              <h1 className="login-title">{title}</h1>
+              <p className="login-sub">{sub}</p>
+              {mode === "signup" && nameField}
+              <div className="login-field">
+                <label className="login-label" htmlFor="email">
+                  Email
+                </label>
+                <div className={`login-phone ${error ? "login-phone-err" : ""}`}>
+                  <input
+                    id="email"
+                    type="email"
+                    inputMode="email"
+                    autoComplete="email"
+                    autoCapitalize="none"
+                    spellCheck={false}
+                    maxLength={254}
+                    placeholder="you@example.com"
+                    value={email}
+                    onChange={(e) => {
+                      setEmail(e.target.value.replace(/\s+/g, ""));
+                      setError(null);
+                      setExists(false);
+                    }}
+                    aria-invalid={!!error}
+                    aria-describedby={error ? "login-error" : undefined}
+                    autoFocus
+                  />
+                </div>
               </div>
+              {passwordStep && passwordField("Password", false)}
+              {mode === "signup" && passwordField("Choose a password", true)}
               {error && (
                 <p id="login-error" className="login-error" role="alert">
                   {error}
                 </p>
               )}
-              <button type="submit" className="login-btn" disabled={!validEmail(email) || busy}>
-                {busy ? "Sending…" : "Send code"}
-              </button>
+              {exists ? (
+                <button type="button" className="login-btn" onClick={() => reset({ mode: "signin", way: "password" })}>
+                  Sign in with this email
+                </button>
+              ) : (
+                <button type="submit" className="login-btn" disabled={!canSubmit}>
+                  {busy ? (passwordStep ? "Signing in…" : "Sending…") : passwordStep ? "Sign in" : "Send code"}
+                </button>
+              )}
+              {mode === "signin" && (
+                <p className="login-ways">
+                  {way === "password" ? (
+                    <>
+                      <button type="button" className="login-link" onClick={() => reset({ way: "code" })}>
+                        Email me a code instead
+                      </button>
+                      <button type="button" className="login-link" onClick={() => reset({ way: "reset" })}>
+                        Forgot password?
+                      </button>
+                    </>
+                  ) : (
+                    <button type="button" className="login-link" onClick={() => reset({ way: "password" })}>
+                      Sign in with password instead
+                    </button>
+                  )}
+                </p>
+              )}
+              {signupOpen && (
+                <p className="login-switch">
+                  {mode === "signin" ? (
+                    <>
+                      New here?{" "}
+                      <button type="button" className="login-link" onClick={() => reset({ mode: "signup" })}>
+                        Create an account
+                      </button>
+                    </>
+                  ) : (
+                    <>
+                      Already have an account?{" "}
+                      <button type="button" className="login-link" onClick={() => reset({ mode: "signin", way: "password" })}>
+                        Sign in
+                      </button>
+                    </>
+                  )}
+                </p>
+              )}
               <p className="login-foot">
-                <ShieldIcon /> Only the owner&apos;s email can open this room
+                <ShieldIcon /> Only you can see your room
               </p>
             </form>
           ) : (
@@ -193,17 +411,32 @@ export default function LoginPage() {
                 className="login-back"
                 onClick={() => {
                   setChallenge(null);
+                  setNeedName(false);
                   setError(null);
                 }}
                 aria-label="Change email"
               >
                 ‹ Change email
               </button>
-              <h1 className="login-title">Enter the code</h1>
+              <h1 className="login-title">{needName ? "Create your account" : way === "reset" && mode === "signin" ? "Choose a new password" : "Enter the code"}</h1>
               <p className="login-sub">
-                {challenge.delivery === "console" ? "For" : "Sent to"} {masked(email)}
+                {challenge.delivery === "console" ? "For" : "Code sent to"} {masked(email)}
                 {challenge.delivery !== "console" && " · check your inbox (and spam)"}
               </p>
+              {needName && (
+                <>
+                  <p className="login-note" role="status">
+                    There is no account for this email yet. Enter your name to create your room.
+                  </p>
+                  {nameField}
+                </>
+              )}
+              {mode === "signin" && way === "reset" && passwordField("New password", true)}
+              {(needName || (mode === "signin" && way === "reset")) && (
+                <p className="login-label" style={{ marginTop: 16 }}>
+                  Code
+                </p>
+              )}
               <div className="login-code" role="group" aria-label="6-digit code">
                 {code.map((d, i) => (
                   <input
@@ -241,8 +474,8 @@ export default function LoginPage() {
                   </button>
                 )}
               </p>
-              <button type="submit" className="login-btn" disabled={code.some((x) => !x) || busy}>
-                {busy ? "Verifying…" : "Verify"}
+              <button type="submit" className="login-btn" disabled={busy || !codeReady(code.join(""))}>
+                {busy ? "Verifying…" : askingName ? "Create account" : way === "reset" && mode === "signin" ? "Save password and sign in" : "Verify"}
               </button>
               {challenge.delivery === "console" && (
                 <p className="login-dev" role="note">

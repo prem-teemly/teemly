@@ -16,11 +16,16 @@
 //
 // Times: notifications.created_at and the "installed" row are UTC (pool timezone "Z"). "Today" for due
 // dates and the digest hour is the server's local day (the owner's machine).
+//
+// Accounts (migration 023): notifications, their facts and settings belong to one user. A sweep runs as
+// one user (the one whose bell asked, or whose call finished) and reads and writes only that user's
+// rows, so a call uploaded by one account never notifies another.
 
 import { getPool } from "./pool.js";
 import { opportunityBoard } from "./opportunityBoard.js";
 import { getLogger } from "../util.js";
 import { stageIndex } from "../stages.js";
+import { uid } from "../tenant.js";
 
 const logger = getLogger("app.db.notifications");
 
@@ -49,7 +54,7 @@ const missingTable = (exc) => exc?.code === "ER_NO_SUCH_TABLE";
 /** Which notifications to make, and the digest hour (0-23, server local time). */
 export async function getPrefs() {
   try {
-    const [[r]] = await getPool().query("SELECT value FROM app_settings WHERE name = 'notifications'");
+    const [[r]] = await getPool().query("SELECT value FROM app_settings WHERE user_id = ? AND name = 'notifications'", [uid()]);
     return { ...DEFAULT_PREFS, ...(r ? parseJson(r.value) : {}) };
   } catch (exc) {
     if (missingTable(exc)) return { ...DEFAULT_PREFS };
@@ -83,8 +88,8 @@ export function parsePrefs(raw) {
 export async function savePrefs(change) {
   const next = { ...(await getPrefs()), ...change };
   await getPool().query(
-    "INSERT INTO app_settings (name, value, updated_at) VALUES ('notifications', ?, ?) AS new ON DUPLICATE KEY UPDATE value = new.value, updated_at = new.updated_at",
-    [JSON.stringify(next), new Date()],
+    "INSERT INTO app_settings (user_id, name, value, updated_at) VALUES (?, 'notifications', ?, ?) AS new ON DUPLICATE KEY UPDATE value = new.value, updated_at = new.updated_at",
+    [uid(), JSON.stringify(next), new Date()],
   );
   return next;
 }
@@ -121,9 +126,10 @@ const KIND_LIST = ["analysis", "failed", "opportunity", "stage", "thanks", "inbo
  */
 export async function listNotifications({ limit = 30, offset = 0, filter = "all", kind = null } = {}) {
   const db = getPool();
+  const user = uid();
   try {
-    const where = ["kind <> 'system'"];
-    const params = [];
+    const where = ["user_id = ?", "kind <> 'system'"];
+    const params = [user];
     if (filter === "unread") where.push("read_at IS NULL");
     if (kind && KIND_LIST.includes(kind)) {
       where.push(kind === "due" ? "kind IN ('due', 'overdue')" : kind === "analysis" ? "kind IN ('analysis', 'failed')" : "kind = ?");
@@ -136,8 +142,8 @@ export async function listNotifications({ limit = 30, offset = 0, filter = "all"
     );
     const seenAt = await getSeenAt();
     const [[c]] = await db.query(
-      `SELECT SUM(read_at IS NULL) AS unread, SUM(read_at IS NULL AND ${LATEST} > ?) AS unseen FROM notifications WHERE kind <> 'system'`,
-      [seenAt],
+      `SELECT SUM(read_at IS NULL) AS unread, SUM(read_at IS NULL AND ${LATEST} > ?) AS unseen FROM notifications WHERE user_id = ? AND kind <> 'system'`,
+      [seenAt, user],
     );
     return { items: rows.slice(0, limit).map(publicNote), has_more: rows.length > limit, unread: Number(c.unread ?? 0), unseen: Number(c.unseen ?? 0) };
   } catch (exc) {
@@ -149,32 +155,33 @@ export async function listNotifications({ limit = 30, offset = 0, filter = "all"
 /** Mark some (ids) or all notifications read. Returns how many changed. */
 export async function markRead({ ids = null, all = false } = {}) {
   const now = new Date();
+  const user = uid();
   if (all) {
-    const [r] = await getPool().query("UPDATE notifications SET read_at = ? WHERE read_at IS NULL", [now]);
+    const [r] = await getPool().query("UPDATE notifications SET read_at = ? WHERE user_id = ? AND read_at IS NULL", [now, user]);
     return r.affectedRows;
   }
   if (!ids?.length) return 0;
-  const [r] = await getPool().query("UPDATE notifications SET read_at = ? WHERE read_at IS NULL AND id IN (?)", [now, ids]);
+  const [r] = await getPool().query("UPDATE notifications SET read_at = ? WHERE user_id = ? AND read_at IS NULL AND id IN (?)", [now, user, ids]);
   return r.affectedRows;
 }
 
 /** Mark notifications unread again (the owner wants to come back to them). */
 export async function markUnread(ids) {
   if (!ids?.length) return 0;
-  const [r] = await getPool().query("UPDATE notifications SET read_at = NULL WHERE read_at IS NOT NULL AND kind <> 'system' AND id IN (?)", [ids]);
+  const [r] = await getPool().query("UPDATE notifications SET read_at = NULL WHERE user_id = ? AND read_at IS NOT NULL AND kind <> 'system' AND id IN (?)", [uid(), ids]);
   return r.affectedRows;
 }
 
 /** When the bell was last opened: rows before that are "seen" (no number on the bell), even if unread. */
 async function getSeenAt() {
-  const [[r]] = await getPool().query("SELECT value FROM app_settings WHERE name = 'notifications_seen'");
+  const [[r]] = await getPool().query("SELECT value FROM app_settings WHERE user_id = ? AND name = 'notifications_seen'", [uid()]);
   const at = r ? parseJson(r.value)?.at : null;
   return at ? new Date(at) : new Date(0);
 }
 export async function markSeen(now = new Date()) {
   await getPool().query(
-    "INSERT INTO app_settings (name, value, updated_at) VALUES ('notifications_seen', ?, ?) AS new ON DUPLICATE KEY UPDATE value = new.value, updated_at = new.updated_at",
-    [JSON.stringify({ at: now.toISOString() }), now],
+    "INSERT INTO app_settings (user_id, name, value, updated_at) VALUES (?, 'notifications_seen', ?, ?) AS new ON DUPLICATE KEY UPDATE value = new.value, updated_at = new.updated_at",
+    [uid(), JSON.stringify({ at: now.toISOString() }), now],
   );
 }
 
@@ -202,10 +209,11 @@ const MAX_ITEMS = 12;
 /** Add notifications: new facts only, merged into their group's row when there is one. */
 async function add(notes, prefs, now = Date.now()) {
   const db = getPool();
+  const user = uid();
   const keep = notes.filter((n) => prefs[PREF_OF[n.kind] ?? n.kind] !== false);
   if (!keep.length) return 0;
   const keys = [...new Set(keep.flatMap((n) => [n.key, ...(n.also ?? [])]))];
-  const [known] = await db.query("SELECT fact_key FROM notification_facts WHERE fact_key IN (?)", [keys]);
+  const [known] = await db.query("SELECT fact_key FROM notification_facts WHERE user_id = ? AND fact_key IN (?)", [user, keys]);
   const done = new Set(known.map((r) => r.fact_key));
   const fresh = [];
   for (const n of keep) {
@@ -219,15 +227,15 @@ async function add(notes, prefs, now = Date.now()) {
   const stamp = new Date(now);
   const facts = async (id, ks) => {
     const list = [...new Set(ks)].filter(Boolean);
-    if (list.length) await db.query("INSERT IGNORE INTO notification_facts (fact_key, notification_id, created_at) VALUES ?", [list.map((k) => [k, id, stamp])]);
+    if (list.length) await db.query("INSERT IGNORE INTO notification_facts (user_id, fact_key, notification_id, created_at) VALUES ?", [list.map((k) => [user, k, id, stamp])]);
   };
   // Rows to merge into: the latest row of each group, from the last 30 days.
   const groups = [...new Set(fresh.map((n) => n.group).filter(Boolean))];
   const byGroup = new Map();
   if (groups.length) {
     const [rows] = await db.query(
-      `SELECT id, group_key, item_count, items FROM notifications WHERE group_key IN (?) AND ${LATEST} > ? ORDER BY ${LATEST}`,
-      [groups, new Date(now - 30 * DAY)],
+      `SELECT id, group_key, item_count, items FROM notifications WHERE user_id = ? AND group_key IN (?) AND ${LATEST} > ? ORDER BY ${LATEST}`,
+      [user, groups, new Date(now - 30 * DAY)],
     );
     for (const r of rows) byGroup.set(r.group_key, { id: Number(r.id), count: Number(r.item_count), items: parseJson(r.items) ?? [] });
   }
@@ -237,9 +245,9 @@ async function add(notes, prefs, now = Date.now()) {
     // A part of a call shown on its own keeps itself as an item, so the call's row can take it in later.
     const items = extra.items ?? n.items ?? (n.group ? [{ ...itemOf(n), at: stamp.toISOString() }] : []);
     const [r] = await db.query(
-      `INSERT IGNORE INTO notifications (kind, title, body, link, avatar_name, dedupe_key, group_key, item_count, items, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      [n.kind, clip(n.title, 200), clip(n.body ?? null, 600), n.link ?? null, clip(n.avatar ?? null, 80), extra.key ?? n.key, extra.group ?? n.group ?? null, extra.count ?? Math.max(1, items.length && n.merge === "append" ? items.length : 1), items.length ? JSON.stringify(items.slice(0, MAX_ITEMS)) : null, n.at ?? stamp, n.at ?? stamp],
+      `INSERT IGNORE INTO notifications (user_id, kind, title, body, link, avatar_name, dedupe_key, group_key, item_count, items, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [user, n.kind, clip(n.title, 200), clip(n.body ?? null, 600), n.link ?? null, clip(n.avatar ?? null, 80), extra.key ?? n.key, extra.group ?? n.group ?? null, extra.count ?? Math.max(1, items.length && n.merge === "append" ? items.length : 1), items.length ? JSON.stringify(items.slice(0, MAX_ITEMS)) : null, n.at ?? stamp, n.at ?? stamp],
     );
     changed += r.affectedRows;
     return r.insertId ? Number(r.insertId) : null;
@@ -251,8 +259,8 @@ async function add(notes, prefs, now = Date.now()) {
       const texts = new Set(row.items.map((i) => i.text));
       row.items = [...row.items, ...n.items.filter((i) => !texts.has(i.text))].slice(0, MAX_ITEMS);
       await db.query(
-        "UPDATE notifications SET kind = ?, title = ?, body = ?, link = ?, avatar_name = COALESCE(?, avatar_name), item_count = ?, items = ?, updated_at = ?, read_at = NULL WHERE id = ?",
-        [n.kind, clip(n.title, 200), clip(n.body ?? null, 600), n.link ?? null, clip(n.avatar ?? null, 80), Math.max(1, row.items.length), JSON.stringify(row.items), stamp, row.id],
+        "UPDATE notifications SET kind = ?, title = ?, body = ?, link = ?, avatar_name = COALESCE(?, avatar_name), item_count = ?, items = ?, updated_at = ?, read_at = NULL WHERE id = ? AND user_id = ?",
+        [n.kind, clip(n.title, 200), clip(n.body ?? null, 600), n.link ?? null, clip(n.avatar ?? null, 80), Math.max(1, row.items.length), JSON.stringify(row.items), stamp, row.id, user],
       );
       changed += 1;
       await facts(row.id, [n.key, ...(n.also ?? [])]);
@@ -263,9 +271,9 @@ async function add(notes, prefs, now = Date.now()) {
     row.items = items.slice(0, MAX_ITEMS);
     row.count += 1;
     if (n.merge === "replace") {
-      await db.query("UPDATE notifications SET title = ?, body = ?, link = ?, avatar_name = COALESCE(?, avatar_name), item_count = ?, items = ?, updated_at = ?, read_at = NULL WHERE id = ?", [clip(n.title, 200), clip(n.body ?? null, 600), n.link ?? null, clip(n.avatar ?? null, 80), row.count, JSON.stringify(row.items), stamp, row.id]);
+      await db.query("UPDATE notifications SET title = ?, body = ?, link = ?, avatar_name = COALESCE(?, avatar_name), item_count = ?, items = ?, updated_at = ?, read_at = NULL WHERE id = ? AND user_id = ?", [clip(n.title, 200), clip(n.body ?? null, 600), n.link ?? null, clip(n.avatar ?? null, 80), row.count, JSON.stringify(row.items), stamp, row.id, user]);
     } else {
-      await db.query("UPDATE notifications SET item_count = ?, items = ?, updated_at = ?, read_at = NULL WHERE id = ?", [row.items.length, JSON.stringify(row.items), stamp, row.id]);
+      await db.query("UPDATE notifications SET item_count = ?, items = ?, updated_at = ?, read_at = NULL WHERE id = ? AND user_id = ?", [row.items.length, JSON.stringify(row.items), stamp, row.id, user]);
     }
     changed += 1;
     await facts(row.id, [n.key, ...(n.also ?? [])]);
@@ -302,31 +310,44 @@ async function add(notes, prefs, now = Date.now()) {
   return changed;
 }
 
+/**
+ * When this user's notifications start: their "installed" row (made when the account was created, or
+ * by migration 016 for the room that existed before accounts). A user without one gets it now.
+ */
 async function installedAt() {
-  const [[r]] = await getPool().query("SELECT created_at FROM notifications WHERE dedupe_key = 'installed'");
-  return r ? r.created_at : new Date();
+  const db = getPool();
+  const user = uid();
+  const [[r]] = await db.query("SELECT created_at FROM notifications WHERE user_id = ? AND dedupe_key = 'installed'", [user]);
+  if (r) return r.created_at;
+  const now = new Date();
+  await db.query(
+    "INSERT IGNORE INTO notifications (user_id, kind, title, body, link, dedupe_key, read_at, created_at, updated_at) VALUES (?, 'system', 'Notifications are on', NULL, NULL, 'installed', ?, ?, ?)",
+    [user, now, now, now],
+  );
+  return now;
 }
 
 /** "Call · 2 people · 1 new opportunity (₹5 L) · 3 follow-ups" for one finished conversation. */
 async function analysisNote(job) {
   const db = getPool();
+  const user = uid();
   const [people] = await db.query(
-    "SELECT p.id, p.name FROM person_mentions m JOIN people p ON p.id = m.person_id WHERE m.job_id = ? ORDER BY m.relation = 'participant' DESC, m.id",
-    [job.id],
+    "SELECT p.id, p.name FROM person_mentions m JOIN people p ON p.id = m.person_id WHERE m.job_id = ? AND p.user_id = ? ORDER BY m.relation = 'participant' DESC, m.id",
+    [job.id, user],
   );
-  const [waiting] = await db.query("SELECT id, name, relation, city, departments, department_suggestions FROM person_suggestions WHERE job_id = ? AND status = 'pending' ORDER BY id", [job.id]);
-  const [opps] = await db.query("SELECT o.id, o.title, o.stage, o.value_inr, o.due_date, p.name AS person FROM opportunities o JOIN people p ON p.id = o.person_id WHERE o.source_job_id = ? AND o.origin = 'ai' ORDER BY o.created_at", [job.id]);
-  const [[actions]] = await db.query("SELECT COUNT(*) AS n FROM action_items a JOIN summaries s ON s.id = a.summary_id WHERE s.job_id = ?", [job.id]);
+  const [waiting] = await db.query("SELECT id, name, relation, city, departments, department_suggestions FROM person_suggestions WHERE user_id = ? AND job_id = ? AND status = 'pending' ORDER BY id", [user, job.id]);
+  const [opps] = await db.query("SELECT o.id, o.title, o.stage, o.value_inr, o.due_date, p.name AS person FROM opportunities o JOIN people p ON p.id = o.person_id WHERE o.user_id = ? AND o.source_job_id = ? AND o.origin = 'ai' ORDER BY o.created_at", [user, job.id]);
+  const [[actions]] = await db.query("SELECT COUNT(*) AS n FROM action_items a JOIN summaries s ON s.id = a.summary_id JOIN processing_jobs j ON j.id = s.job_id WHERE j.user_id = ? AND s.job_id = ?", [user, job.id]);
   let moves = [];
   let ideas = [];
   try {
     [moves] = await db.query(
       `SELECT c.id, c.from_stage, c.to_stage, o.id AS opp_id, o.title, p.name AS person FROM opportunity_stage_changes c
          JOIN opportunities o ON o.id = c.opportunity_id JOIN people p ON p.id = o.person_id
-        WHERE c.source_job_id = ? AND c.changed_by = 'ai' AND c.from_stage IS NOT NULL ORDER BY c.id`,
-      [job.id],
+        WHERE o.user_id = ? AND c.source_job_id = ? AND c.changed_by = 'ai' AND c.from_stage IS NOT NULL ORDER BY c.id`,
+      [user, job.id],
     );
-    [ideas] = await db.query("SELECT id, name, said_by FROM department_suggestions WHERE job_id = ? AND status = 'pending'", [job.id]);
+    [ideas] = await db.query("SELECT id, name, said_by FROM department_suggestions WHERE user_id = ? AND job_id = ? AND status = 'pending'", [user, job.id]);
   } catch (exc) {
     if (!missingTable(exc)) throw exc;
   }
@@ -369,6 +390,7 @@ const dayOf = (v) => (v instanceof Date ? v.toISOString().slice(0, 10) : v ? Str
  */
 export async function sweep({ now = Date.now(), doneJobs = [] } = {}) {
   const db = getPool();
+  const user = uid();
   let since;
   try {
     since = await installedAt();
@@ -383,8 +405,8 @@ export async function sweep({ now = Date.now(), doneJobs = [] } = {}) {
   const [jobs] = await db.query(
     `SELECT j.id, j.kind, j.status, j.error_message, j.finished_at, f.original_name AS name
        FROM processing_jobs j JOIN audio_files f ON f.id = j.audio_file_id
-      WHERE j.status IN ('completed', 'failed') AND j.finished_at > ? ORDER BY j.finished_at`,
-    [since],
+      WHERE j.user_id = ? AND j.status IN ('completed', 'failed') AND j.finished_at > ? ORDER BY j.finished_at`,
+    [user, since],
   );
   for (const j of jobs) {
     if (j.status === "failed") {
@@ -398,8 +420,8 @@ export async function sweep({ now = Date.now(), doneJobs = [] } = {}) {
   const [opps] = await db.query(
     `SELECT o.id, o.title, o.stage, o.value_inr, o.due_date, o.source_job_id, o.created_at, p.name AS person
        FROM opportunities o JOIN people p ON p.id = o.person_id
-      WHERE o.origin = 'ai' AND o.created_at > ? ORDER BY o.created_at`,
-    [since],
+      WHERE o.user_id = ? AND o.origin = 'ai' AND o.created_at > ? ORDER BY o.created_at`,
+    [user, since],
   );
   for (const o of opps) {
     const sub = [o.title, o.value_inr !== null ? fmtInr(Number(o.value_inr)) : null, o.stage, o.due_date ? `due ${dayOf(o.due_date)}` : null].filter(Boolean).join(" · ");
@@ -423,8 +445,8 @@ export async function sweep({ now = Date.now(), doneJobs = [] } = {}) {
     const [moves] = await db.query(
       `SELECT c.id, c.from_stage, c.to_stage, c.created_at, o.id AS opp_id, o.title, p.name AS person
          FROM opportunity_stage_changes c JOIN opportunities o ON o.id = c.opportunity_id JOIN people p ON p.id = o.person_id
-        WHERE c.changed_by = 'ai' AND c.from_stage IS NOT NULL AND c.created_at > ? ORDER BY c.created_at`,
-      [since],
+        WHERE o.user_id = ? AND c.changed_by = 'ai' AND c.from_stage IS NOT NULL AND c.created_at > ? ORDER BY c.created_at`,
+      [user, since],
     );
     for (const m of moves) {
       // One row per deal: later moves update it ("2 updates").
@@ -434,9 +456,9 @@ export async function sweep({ now = Date.now(), doneJobs = [] } = {}) {
     const [forward] = await db.query(
       `SELECT c.id, c.from_stage, c.to_stage, c.created_at, o.id AS opp_id, o.title, p.name AS person, i.id AS intro_id, i.name AS intro
          FROM opportunity_stage_changes c JOIN opportunities o ON o.id = c.opportunity_id
-         JOIN people p ON p.id = o.person_id JOIN people i ON i.id = p.introduced_by_id
-        WHERE c.from_stage IS NOT NULL AND c.created_at > ? AND o.stage = c.to_stage ORDER BY c.created_at`,
-      [since],
+         JOIN people p ON p.id = o.person_id JOIN people i ON i.id = p.introduced_by_id AND i.user_id = p.user_id
+        WHERE o.user_id = ? AND c.from_stage IS NOT NULL AND c.created_at > ? AND o.stage = c.to_stage ORDER BY c.created_at`,
+      [user, since],
     );
     for (const m of forward) {
       if (!(m.to_stage === "Won" || stageIndex(m.to_stage) > stageIndex(m.from_stage))) continue;
@@ -461,8 +483,8 @@ export async function sweep({ now = Date.now(), doneJobs = [] } = {}) {
   const [waiting] = await db.query(
     `SELECT s.job_id, GROUP_CONCAT(s.name ORDER BY s.id SEPARATOR ', ') AS names, COUNT(*) AS n, MAX(s.created_at) AS at, MAX(f.original_name) AS file
        FROM person_suggestions s JOIN processing_jobs j ON j.id = s.job_id JOIN audio_files f ON f.id = j.audio_file_id
-      WHERE s.status = 'pending' AND s.created_at > ? GROUP BY s.job_id`,
-    [since],
+      WHERE s.user_id = ? AND s.status = 'pending' AND s.created_at > ? GROUP BY s.job_id`,
+    [user, since],
   );
   for (const w of waiting) {
     const n = Number(w.n);
@@ -481,7 +503,7 @@ export async function sweep({ now = Date.now(), doneJobs = [] } = {}) {
     });
   }
   try {
-    const [ideas] = await db.query("SELECT id, job_id, name, said_by, reason, created_at FROM department_suggestions WHERE status = 'pending' AND created_at > ?", [since]);
+    const [ideas] = await db.query("SELECT id, job_id, name, said_by, reason, created_at FROM department_suggestions WHERE user_id = ? AND status = 'pending' AND created_at > ?", [user, since]);
     for (const d of ideas) {
       notes.push({ kind: "inbox", key: `idea:${d.id}`, group: `call:${d.job_id}`, merge: "append", item: { kind: "inbox", text: `Department idea: ${d.name}`, sub: d.said_by ? `Suggested by ${d.said_by}` : null, link: "/inbox", action: "Review" }, title: `Department idea: ${d.name}`, body: [d.said_by ? `Suggested by ${d.said_by}` : null, d.reason].filter(Boolean).join(". "), link: "/inbox", avatar: d.said_by ?? null, at: d.created_at });
     }
@@ -523,23 +545,28 @@ export async function sweep({ now = Date.now(), doneJobs = [] } = {}) {
   return added;
 }
 
-/** Read notifications older than 30 days are removed (at most once an hour); unread ones stay. */
-let lastCleanup = 0;
+/** Read notifications older than 30 days are removed (each user at most once an hour); unread ones stay. */
+const lastCleanup = new Map(); // user id -> ms
 async function cleanup(now) {
-  if (now - lastCleanup < 3600_000) return;
-  lastCleanup = now;
-  await getPool().query("DELETE FROM notifications WHERE kind <> 'system' AND read_at IS NOT NULL AND read_at < ?", [new Date(now - 30 * DAY)]);
+  const user = uid();
+  if (now - (lastCleanup.get(user) ?? 0) < 3600_000) return;
+  lastCleanup.set(user, now);
+  await getPool().query("DELETE FROM notifications WHERE user_id = ? AND kind <> 'system' AND read_at IS NOT NULL AND read_at < ?", [user, new Date(now - 30 * DAY)]);
 }
 
 /** Today in one line: calls, new opportunities, follow-ups, the inbox. */
 async function digestNote(now) {
   const db = getPool();
+  const user = uid();
   const start = new Date(now);
   start.setHours(0, 0, 0, 0);
-  const [[calls]] = await db.query("SELECT COUNT(*) AS n FROM processing_jobs WHERE status = 'completed' AND finished_at >= ?", [start]);
-  const [opps] = await db.query("SELECT value_inr FROM opportunities WHERE created_at >= ?", [start]);
-  const [[open]] = await db.query("SELECT COUNT(*) AS n FROM action_items WHERE status = 'open'");
-  const [[waiting]] = await db.query("SELECT COUNT(*) AS n FROM person_suggestions WHERE status = 'pending'");
+  const [[calls]] = await db.query("SELECT COUNT(*) AS n FROM processing_jobs WHERE user_id = ? AND status = 'completed' AND finished_at >= ?", [user, start]);
+  const [opps] = await db.query("SELECT value_inr FROM opportunities WHERE user_id = ? AND created_at >= ?", [user, start]);
+  const [[open]] = await db.query(
+    "SELECT COUNT(*) AS n FROM action_items a JOIN summaries s ON s.id = a.summary_id JOIN processing_jobs j ON j.id = s.job_id WHERE j.user_id = ? AND a.status = 'open'",
+    [user],
+  );
+  const [[waiting]] = await db.query("SELECT COUNT(*) AS n FROM person_suggestions WHERE user_id = ? AND status = 'pending'", [user]);
   const value = opps.reduce((s, o) => s + Number(o.value_inr ?? 0), 0);
   const parts = [
     plural(Number(calls.n), "call analysed", "calls analysed"),
@@ -552,34 +579,38 @@ async function digestNote(now) {
 
 // -------------------------------------------------------------------- when to sweep
 
-let last = 0;
-let running = null;
+// Per user: when their last sweep started, and the sweep running now (one at a time per user).
+const last = new Map(); // user id -> ms
+const running = new Map(); // user id -> Promise
 
-/** Sweep at most every few seconds (the bell asks often); errors are logged, never thrown. */
+/** Sweep the current user's notifications at most every few seconds (the bell asks often); errors are logged, never thrown. */
 export function sweepSoon({ now = Date.now(), force = false, doneJobs = [] } = {}) {
-  if (running) return running;
-  if (!force && now - last < SWEEP_EVERY_MS) return Promise.resolve(0);
-  last = now;
-  running = sweep({ now, doneJobs })
+  const user = uid();
+  if (running.has(user)) return running.get(user);
+  if (!force && now - (last.get(user) ?? 0) < SWEEP_EVERY_MS) return Promise.resolve(0);
+  last.set(user, now);
+  const p = sweep({ now, doneJobs })
     .catch((exc) => {
-      logger.warning(`Notifications: could not be updated (${exc?.message ?? "error"})`);
+      logger.warning(`Notifications: could not be updated for user ${user} (${exc?.message ?? "error"})`);
       return 0;
     })
     .finally(() => {
-      running = null;
+      running.delete(user);
     });
-  return running;
+  running.set(user, p);
+  return p;
 }
 
-/** After a conversation's people are found: announce it now (and anything else due). */
+/** After a conversation's people are found: announce it now to its owner (and anything else due). */
 export async function conversationDone(jobId) {
-  if (running) await running; // a sweep in progress would skip this job's note
+  const user = uid();
+  if (running.has(user)) await running.get(user); // a sweep in progress would skip this job's note
   return sweepSoon({ force: true, doneJobs: [jobId] });
 }
 
 /** Tests: forget the sweep throttle. */
 export const resetForTests = () => {
-  last = 0;
-  running = null;
-  lastCleanup = 0;
+  last.clear();
+  running.clear();
+  lastCleanup.clear();
 };

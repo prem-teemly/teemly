@@ -397,12 +397,18 @@ export function formatClock(seconds: number): string {
 // ------------------------------------------------------------------------------ login
 
 export type AuthUser = { name: string; initials: string; email_masked: string; role: "owner" | "member" };
-export type AuthState = { auth_enabled: boolean; user: AuthUser | null };
+/** Sign-in is always on; `signup` says whether new accounts can be made (restricted = only some emails). */
+export type AuthState = { auth_enabled: boolean; user: AuthUser | null; signup?: { enabled: boolean; restricted: boolean } };
 export type OtpRequest = { challenge_id: string; expires_in: number; resend_in: number; delivery: "console" | "email"; message: string };
+/** What a code is asked for: sign in, create an account, or "Forgot password" (then a new one is set). */
+export type AuthIntent = "signin" | "signup" | "reset";
 
-/** Login-related calls; errors carry the backend's message (and retry_after for rate limits). */
+/**
+ * Login-related calls; errors carry the backend's message, retry_after for rate limits, and `code` for
+ * answers the page acts on ("name_required": no account yet, ask for the name; "signup_closed").
+ */
 export class AuthError extends ApiError {
-  constructor(message: string, readonly status: number, readonly retryAfter: number | null = null) {
+  constructor(message: string, readonly status: number, readonly retryAfter: number | null = null, readonly code: string | null = null) {
     super(message);
   }
 }
@@ -420,26 +426,48 @@ async function authCall<T>(path: string, body?: unknown): Promise<T> {
   } catch {
     throw networkError();
   }
-  let data: { message?: string; retry_after?: number } & Record<string, unknown> = {};
+  let data: { message?: string; retry_after?: number; code?: string } & Record<string, unknown> = {};
   try {
     data = await res.json();
   } catch {
     /* not JSON */
   }
-  if (!res.ok) throw new AuthError(typeof data.message === "string" ? data.message : `Request failed (HTTP ${res.status})`, res.status, data.retry_after ?? null);
+  if (!res.ok) {
+    const message = typeof data.message === "string" ? data.message : `Request failed (HTTP ${res.status})`;
+    throw new AuthError(message, res.status, data.retry_after ?? null, typeof data.code === "string" ? data.code : null);
+  }
   return data as T;
 }
 
 export const getAuth = () => authCall<AuthState>("/api/auth/me");
-export const requestOtp = (email: string) => authCall<OtpRequest>("/api/auth/otp/request", { email });
-export const verifyOtp = (challengeId: string, code: string) => authCall<{ user: AuthUser }>("/api/auth/otp/verify", { challenge_id: challengeId, code });
+/** Email a code. Sign-up sends the name first, so an email that cannot make an account is told at once. */
+export const requestOtp = (email: string, intent: AuthIntent = "signin", name: string | null = null) =>
+  authCall<OtpRequest>("/api/auth/otp/request", { email, intent, ...(name ? { name } : {}) });
+/**
+ * Check the code; with `name`, an email without an account gets one (201, created: true); with
+ * `password`, it becomes the account's password (a new account, or "Forgot password").
+ */
+export const verifyOtp = (challengeId: string, code: string, email: string, name: string | null = null, password: string | null = null) =>
+  authCall<{ user: AuthUser; created: boolean; password_set: boolean }>("/api/auth/otp/verify", {
+    challenge_id: challengeId,
+    code,
+    email,
+    ...(name ? { name } : {}),
+    ...(password ? { password } : {}),
+  });
+/** Sign in with email + password. */
+export const passwordLogin = (email: string, password: string) => authCall<{ user: AuthUser }>("/api/auth/password/login", { email, password });
+/** Set a first password, or change it (the current one is needed then). Other devices are signed out. */
+export const setMyPassword = (newPassword: string, currentPassword: string | null = null) =>
+  authCall<{ signed_out: number }>("/api/auth/password", { new_password: newPassword, ...(currentPassword ? { current_password: currentPassword } : {}) });
 export const logout = () => authCall<{ status: string }>("/api/auth/logout", {});
+export const updateMyName = (name: string) => authCall<{ user: AuthUser }>("/api/auth/profile", { name });
 
 // ---------------------------------------------------------------------------- profile
 
 export type DeviceSession = { id: number; device: string; signed_in_at: string; last_seen_at: string; expires_at: string; current: boolean };
 export type Profile = {
-  user: AuthUser & { member_since: string | null; last_login_at: string | null };
+  user: AuthUser & { member_since: string | null; last_login_at: string | null; has_password?: boolean; password_set_at?: string | null };
   /** null when the people tables are not available. */
   room: { people: number; conversations: number; open_opportunities: number; open_value_inr: number; inbox_pending: number } | null;
   sessions: DeviceSession[];

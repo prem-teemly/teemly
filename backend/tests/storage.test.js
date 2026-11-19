@@ -9,6 +9,7 @@ import { unlink } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 
+import "./helpers/no-login.js";
 import { startFakeOci } from "./helpers/fake-oci.js";
 
 const fake = await startFakeOci();

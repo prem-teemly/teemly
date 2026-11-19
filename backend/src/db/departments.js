@@ -6,14 +6,32 @@
 // the AI from what their calls say, or by the owner) or when the person has an opportunity in it.
 // Money is only what was said in a conversation or typed by the owner: opportunity values in rupees.
 
-import * as config from "../config.js";
 import { STAGES, STAGE_CHANCE } from "../stages.js";
 import { getPool, withTransaction } from "./pool.js";
+import { ownerName, uid } from "../tenant.js";
 import { WorkError, chanceOf } from "./personWork.js";
 import { hexId } from "../util.js";
 
-/** The built-in eight (used when the database is not reachable, and by tests without migration 009). */
-export const BUILT_IN = ["Investment", "Sales", "Channel partners", "Accounts", "Marketing", "Tech & AI", "Govt tenders", "Vendors"];
+/** The eight departments every new room starts with (as first added by migration 009). */
+export const BUILT_IN_DEFS = Object.freeze([
+  { slug: "investment", name: "Investment", color: "#6c63f6", description: "Investors and HNIs who invest or may invest money in the owner's company: angels, VCs, funds, wealthy individuals" },
+  { slug: "sales", name: "Sales", color: "#2fae6a", description: "Customers and buyers, and partners who bring direct sales" },
+  { slug: "channel-partners", name: "Channel partners", color: "#18a7b5", description: "Distributors, resellers and partners who sell or refer the owner's product" },
+  { slug: "accounts", name: "Accounts", color: "#64748b", description: "Chartered accountants, auditors, tax and finance people" },
+  { slug: "marketing", name: "Marketing", color: "#e2507a", description: "Marketing and advertising agencies, PR, designers, influencers" },
+  { slug: "tech-ai", name: "Tech & AI", color: "#3b82f6", description: "Developers, AI and tech experts, technical advisors" },
+  { slug: "govt-tenders", name: "Govt tenders", color: "#d4891b", description: "Government officials and contacts for government tenders and bids" },
+  { slug: "vendors", name: "Vendors", color: "#9a6b4b", description: "Suppliers of goods or services to the owner: hardware, printing, contractors" },
+]);
+/** The built-in eight's names (used when the database is not reachable, and by tests). */
+export const BUILT_IN = BUILT_IN_DEFS.map((d) => d.name);
+
+/** Give a new room its built-in departments (inside the caller's transaction; existing ones are kept). */
+export async function seedDepartments(conn, userId) {
+  const rows = BUILT_IN_DEFS.map((d, i) => [hexId(), userId, d.slug, d.name, d.color, d.description, 1, (i + 1) * 10]);
+  await conn.query("INSERT IGNORE INTO departments (id, user_id, slug, name, color, description, built_in, sort_order) VALUES ?", [rows]);
+  clearDepartmentCache(userId);
+}
 export const MAX_DEPARTMENTS = 30;
 /** Colours the owner can pick for a new department. */
 export const PALETTE = ["#6c63f6", "#2fae6a", "#18a7b5", "#64748b", "#e2507a", "#3b82f6", "#d4891b", "#9a6b4b", "#0f8b8d", "#c2410c", "#7c3aed", "#be123c", "#15803d", "#0369a1"];
@@ -23,7 +41,7 @@ const isoOf = (epoch) => (epoch === null || epoch === undefined ? null : new Dat
 
 // ------------------------------------------------------------------------------ the list
 
-let cache = null; // { at, list }
+const cache = new Map(); // user id -> { at, list }
 const CACHE_MS = 30_000;
 
 /** Dashboards a department's page can use (migration 020). */
@@ -56,10 +74,13 @@ const publicDepartment = (r) => ({
 
 /** All departments in display order (cached briefly; changes here clear the cache). */
 export async function listDepartments({ fresh = false } = {}) {
-  if (!fresh && cache && Date.now() - cache.at < CACHE_MS) return cache.list;
-  const [rows] = await getPool().query("SELECT * FROM departments ORDER BY sort_order, created_at, name");
-  cache = { at: Date.now(), list: rows.map(publicDepartment) };
-  return cache.list;
+  const user = uid();
+  const hit = cache.get(user);
+  if (!fresh && hit && Date.now() - hit.at < CACHE_MS) return hit.list;
+  const [rows] = await getPool().query("SELECT * FROM departments WHERE user_id = ? ORDER BY sort_order, created_at, name", [user]);
+  const list = rows.map(publicDepartment);
+  cache.set(user, { at: Date.now(), list });
+  return list;
 }
 
 /** Department names, falling back to the built-in eight when the table is not there (yet). */
@@ -71,8 +92,10 @@ export async function departmentNames() {
   }
 }
 
-export const clearDepartmentCache = () => {
-  cache = null;
+/** Forget the cached departments of one user (the current user by default), or of everyone (null). */
+export const clearDepartmentCache = (userId = undefined) => {
+  if (userId === null) cache.clear();
+  else cache.delete(userId ?? uid());
 };
 
 export function slugOf(name) {
@@ -130,16 +153,17 @@ export function parseDepartment(raw, { partial = false } = {}) {
 }
 
 export async function createDepartment(data) {
+  const user = uid();
   const d = await withTransaction(async (conn) => {
-    const [[{ n, last }]] = await conn.query("SELECT COUNT(*) AS n, COALESCE(MAX(sort_order), 0) AS last FROM departments FOR UPDATE");
+    const [[{ n, last }]] = await conn.query("SELECT COUNT(*) AS n, COALESCE(MAX(sort_order), 0) AS last FROM departments WHERE user_id = ? FOR UPDATE", [user]);
     if (Number(n) >= MAX_DEPARTMENTS) throw new WorkError(409, `You can have at most ${MAX_DEPARTMENTS} departments.`);
     const slug = slugOf(data.name);
-    const [[dup]] = await conn.execute("SELECT name FROM departments WHERE name = ? OR slug = ? LIMIT 1", [data.name, slug]);
+    const [[dup]] = await conn.execute("SELECT name FROM departments WHERE user_id = ? AND (name = ? OR slug = ?) LIMIT 1", [user, data.name, slug]);
     if (dup) throw new WorkError(409, `A department called "${dup.name}" already exists.`);
     const id = hexId();
     const color = data.color ?? PALETTE[Number(n) % PALETTE.length];
-    await conn.execute("INSERT INTO departments (id, slug, name, color, description, built_in, sort_order) VALUES (?, ?, ?, ?, ?, 0, ?)", [id, slug, data.name, color, data.description ?? null, Number(last) + 10]);
-    if (data.view_type) await conn.execute("UPDATE departments SET view_type = ? WHERE id = ?", [data.view_type, id]);
+    await conn.execute("INSERT INTO departments (id, user_id, slug, name, color, description, built_in, sort_order) VALUES (?, ?, ?, ?, ?, ?, 0, ?)", [id, user, slug, data.name, color, data.description ?? null, Number(last) + 10]);
+    if (data.view_type) await conn.execute("UPDATE departments SET view_type = ? WHERE id = ? AND user_id = ?", [data.view_type, id, user]);
     return publicDepartment({ id, slug, name: data.name, color, description: data.description ?? null, built_in: 0, goal_label: null, target_inr: null, view_type: data.view_type ?? null });
   });
   clearDepartmentCache();
@@ -157,23 +181,25 @@ export async function updateDepartment(id, data) {
     params.push(data[f]);
   }
   const db = getPool();
-  if (sets.length) await db.execute(`UPDATE departments SET ${sets.join(", ")} WHERE id = ?`, [...params, id]);
+  const user = uid();
+  if (sets.length) await db.execute(`UPDATE departments SET ${sets.join(", ")} WHERE id = ? AND user_id = ?`, [...params, id, user]);
   clearDepartmentCache();
-  const [[row]] = await db.execute("SELECT * FROM departments WHERE id = ?", [id]);
+  const [[row]] = await db.execute("SELECT * FROM departments WHERE id = ? AND user_id = ?", [id, user]);
   return row ? publicDepartment(row) : null;
 }
 
 /** Delete a department the owner added: it is taken off every person and opportunity. */
 export async function deleteDepartment(id) {
+  const user = uid();
   const done = await withTransaction(async (conn) => {
-    const [[d]] = await conn.execute("SELECT name, built_in FROM departments WHERE id = ? FOR UPDATE", [id]);
+    const [[d]] = await conn.execute("SELECT name, built_in FROM departments WHERE id = ? AND user_id = ? FOR UPDATE", [id, user]);
     if (!d) return false;
     if (d.built_in) throw new WorkError(409, "Built-in departments cannot be deleted.");
     const strip = (col) => `${col} = TRIM(BOTH ',' FROM REPLACE(CONCAT(',', ${col}, ','), CONCAT(',', ?, ','), ','))`;
-    await conn.execute(`UPDATE people SET ${strip("departments")} WHERE FIND_IN_SET(?, departments)`, [d.name, d.name]);
-    await conn.execute(`UPDATE person_suggestions SET ${strip("departments")} WHERE FIND_IN_SET(?, departments)`, [d.name, d.name]);
-    await conn.execute("UPDATE opportunities SET department = NULL WHERE department = ?", [d.name]);
-    await conn.execute("DELETE FROM departments WHERE id = ?", [id]);
+    await conn.execute(`UPDATE people SET ${strip("departments")} WHERE user_id = ? AND FIND_IN_SET(?, departments)`, [d.name, user, d.name]);
+    await conn.execute(`UPDATE person_suggestions SET ${strip("departments")} WHERE user_id = ? AND FIND_IN_SET(?, departments)`, [d.name, user, d.name]);
+    await conn.execute("UPDATE opportunities SET department = NULL WHERE user_id = ? AND department = ?", [user, d.name]);
+    await conn.execute("DELETE FROM departments WHERE id = ? AND user_id = ?", [id, user]);
     return true;
   });
   clearDepartmentCache();
@@ -185,20 +211,25 @@ export async function deleteDepartment(id) {
 /** Everyone with their departments and score, plus every opportunity (small tables: one query each). */
 async function loadAll() {
   const db = getPool();
+  const user = uid();
   const [people] = await db.query(
     // people and opportunities times are written from JavaScript Dates (read back as Dates, like
     // db/people.js does); audio_files.created_at is written by MySQL, so it is read with UNIX_TIMESTAMP.
     `SELECT p.id, p.name, p.category, p.role_title, p.organisation, p.city, p.departments, p.score, p.consent,
             p.last_contact_at AS last_contact, p.last_contact_kind, i.id AS intro_id, i.name AS intro_name
-       FROM people p LEFT JOIN people i ON i.id = p.introduced_by_id`,
+       FROM people p LEFT JOIN people i ON i.id = p.introduced_by_id AND i.user_id = p.user_id
+      WHERE p.user_id = ?`,
+    [user],
   );
   const [opps] = await db.query(
     `SELECT o.id, o.person_id, o.title, o.stage, o.department, o.value_inr, o.chance_pct, o.next_step, o.due_date, o.origin, o.source_job_id,
             o.created_at AS created, o.updated_at AS updated,
             f.original_name AS source_name, j.kind AS source_kind, UNIX_TIMESTAMP(f.created_at) AS source_epoch
        FROM opportunities o
-       LEFT JOIN processing_jobs j ON j.id = o.source_job_id
-       LEFT JOIN audio_files f ON f.id = j.audio_file_id`,
+       LEFT JOIN processing_jobs j ON j.id = o.source_job_id AND j.user_id = o.user_id
+       LEFT JOIN audio_files f ON f.id = j.audio_file_id
+      WHERE o.user_id = ?`,
+    [user],
   );
   const dateIso = (v) => (v instanceof Date ? v.toISOString() : v ? new Date(v).toISOString() : null);
   return {
@@ -462,15 +493,15 @@ async function dashboardExtras({ d, rows, dOpps, open, won, people, opps }) {
   // Open commitments from the calls these people were in (promises, deliveries, tasks).
   let commitments = [];
   if (rows.length) {
-    const owner = String(config.AUTH.ownerName ?? "").trim().split(/\s+/)[0]?.toLowerCase() ?? "";
+    const owner = ownerName().trim().split(/\s+/)[0]?.toLowerCase() ?? "";
     const [acts] = await db.query(
       `SELECT a.id, a.task, a.responsible_person, a.deadline_text, a.date_text, s.job_id, m.person_id, UNIX_TIMESTAMP(f.created_at) AS epoch
          FROM action_items a JOIN summaries s ON s.id = a.summary_id
          JOIN person_mentions m ON m.job_id = s.job_id
          JOIN processing_jobs j ON j.id = s.job_id JOIN audio_files f ON f.id = j.audio_file_id
-        WHERE a.status = 'open' AND m.person_id IN (?)
+        WHERE j.user_id = ? AND a.status = 'open' AND m.person_id IN (?)
         ORDER BY f.created_at DESC, a.seq LIMIT 120`,
-      [[...memberIds]],
+      [uid(), [...memberIds]],
     );
     const seen = new Set();
     const nameOf = new Map(rows.map((r) => [r.id, r.name]));
@@ -526,8 +557,8 @@ async function conversationsOf(personIds) {
   const [rows] = await db.query(
     `SELECT m.person_id, m.job_id, m.interest, m.relation FROM person_mentions m
        JOIN processing_jobs j ON j.id = m.job_id JOIN audio_files f ON f.id = j.audio_file_id
-      WHERE m.person_id IN (?) ORDER BY f.created_at, m.id`,
-    [personIds],
+      WHERE j.user_id = ? AND m.person_id IN (?) ORDER BY f.created_at, m.id`,
+    [uid(), personIds],
   );
   for (const r of rows) {
     if (!history.has(r.person_id)) history.set(r.person_id, []);
@@ -535,7 +566,7 @@ async function conversationsOf(personIds) {
   }
   const jobs = [...new Set(rows.filter((r) => r.relation === "mentioned").map((r) => r.job_id))];
   if (jobs.length) {
-    const owner = String(config.AUTH.ownerName ?? "").toLowerCase();
+    const owner = ownerName().toLowerCase();
     const [speakers] = await db.query(
       "SELECT t.job_id, s.label FROM speakers s JOIN transcripts t ON t.id = s.transcript_id WHERE t.job_id IN (?) ORDER BY s.total_seconds DESC",
       [jobs],

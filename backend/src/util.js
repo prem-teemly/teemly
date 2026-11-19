@@ -33,9 +33,11 @@ export const hexId = () => randomUUID().replaceAll("-", "");
 
 /** Error whose message is returned to the client as {"status": "error", "message": ...}. */
 export class HttpError extends Error {
-  constructor(status, message) {
+  /** `code`: optional machine-readable reason for the client (e.g. "name_required"). */
+  constructor(status, message, code = null) {
     super(message);
     this.status = status;
+    this.code = code;
   }
 }
 

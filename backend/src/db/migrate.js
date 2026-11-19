@@ -23,7 +23,12 @@ export function listMigrations(dir = MIGRATIONS_DIR) {
     .sort()
     .map((file) => {
       const sql = readFileSync(path.join(dir, file), "utf8");
-      return { version: parseInt(file.slice(0, 3), 10), name: file, sql, checksum: createHash("sha256").update(sql).digest("hex") };
+      const sha = (s) => createHash("sha256").update(s).digest("hex");
+      // Git may check a file out with LF or CRLF line endings (Windows vs Linux): the same migration is
+      // the same migration either way, so a checksum recorded with either ending matches.
+      const lf = sql.replace(/\r\n/g, "\n");
+      const variants = new Set([sha(sql), sha(lf), sha(lf.replace(/\n/g, "\r\n"))]);
+      return { version: parseInt(file.slice(0, 3), 10), name: file, sql, checksum: sha(sql), checksums: variants };
     });
 }
 
@@ -57,7 +62,7 @@ export async function migrate({ statusOnly = false, log = console.log } = {}) {
 
     for (const m of migrations) {
       const done = applied.get(m.version);
-      if (done && done.checksum !== m.checksum) {
+      if (done && !m.checksums.has(done.checksum)) {
         throw new Error(`${m.name} was changed after it was applied (checksum mismatch). Add a new migration instead of editing it.`);
       }
     }

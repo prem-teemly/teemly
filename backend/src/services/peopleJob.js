@@ -10,6 +10,7 @@ import { extractAll } from "./people.js";
 import { recordDepartmentIdeas } from "../db/departmentIdeas.js";
 import { conversationDone } from "../db/notifications.js";
 import { linesFromMessages, linesFromSegments } from "./pulse.js";
+import { runAs } from "../tenant.js";
 import { getLogger } from "../util.js";
 
 const logger = getLogger("app.services.people");
@@ -31,42 +32,47 @@ function aboutText(job, name) {
   return (text || `${job.kind === "whatsapp" ? "Chat" : "Call"} added to ${name}'s timeline.`).slice(0, 1000);
 }
 
-/** Start finding people for a completed job once `saved` (its database writes) has finished. */
+/**
+ * Start finding people for a completed job once `saved` (its database writes) has finished. Runs as
+ * the job's owner: their People, inbox and departments, and the notification goes to them only.
+ */
 export function afterJob(job, saved) {
   if (job.status !== "completed" || !repo.enabled()) return;
   const p = Promise.resolve(saved)
     .catch(() => {})
-    .then(async () => {
-      const target = job.personId ? await personRef(job.personId) : null;
-      try {
-        const lines = jobLines(job);
-        // When it was uploaded: "by Friday" in the call becomes that Friday's date.
-        const { people, departmentIdeas } = await extractAll(lines, undefined, { callAt: job.createdAt ? job.createdAt * 1000 : Date.now() });
-        const { linked, suggested, opportunities } = await recordPeople(job.id, job.kind, people, lines, target);
-        // New departments someone said the owner should create: to the inbox (never changes People).
-        const ideas = await recordDepartmentIdeas(job.id, departmentIdeas).catch((exc) => {
-          logger.warning(`People: department ideas could not be stored for job ${job.id} (${exc?.message ?? "error"})`);
-          return 0;
-        });
-        logger.info(`People: ${people.length} found in job ${job.id} (${linked.length} already in People, ${suggested} to the inbox, ${opportunities} opportunit${opportunities === 1 ? "y" : "ies"} captured, ${ideas} new department idea${ideas === 1 ? "" : "s"})`);
-        return people;
-      } catch (exc) {
-        logger.warning(`People: could not be found for job ${job.id} (${exc?.message ?? exc?.name ?? "error"})`);
-        return null;
-      } finally {
-        // Uploaded on a person's page: it is on their timeline even if the AI did not name them.
-        if (target) {
-          await linkJobToPerson(job.id, job.kind, target.id, aboutText(job, target.name)).catch((exc) =>
-            logger.warning(`People: could not add job ${job.id} to the person's timeline (${exc?.message ?? "error"})`),
-          );
-        }
-        // The bell: "Call analysed", new opportunities, people for the inbox (never fails the job).
-        await conversationDone(job.id).catch(() => 0);
-      }
-    })
+    .then(() => runAs(job.owner, () => findPeople(job)))
     .catch(() => null)
     .finally(() => running.delete(job.id));
   running.set(job.id, p);
+}
+
+async function findPeople(job) {
+  const target = job.personId ? await personRef(job.personId) : null;
+  try {
+    const lines = jobLines(job);
+    // When it was uploaded: "by Friday" in the call becomes that Friday's date.
+    const { people, departmentIdeas } = await extractAll(lines, job.owner.name, { callAt: job.createdAt ? job.createdAt * 1000 : Date.now() });
+    const { linked, suggested, opportunities } = await recordPeople(job.id, job.kind, people, lines, target);
+    // New departments someone said the owner should create: to the inbox (never changes People).
+    const ideas = await recordDepartmentIdeas(job.id, departmentIdeas).catch((exc) => {
+      logger.warning(`People: department ideas could not be stored for job ${job.id} (${exc?.message ?? "error"})`);
+      return 0;
+    });
+    logger.info(`People: ${people.length} found in job ${job.id} (${linked.length} already in People, ${suggested} to the inbox, ${opportunities} opportunit${opportunities === 1 ? "y" : "ies"} captured, ${ideas} new department idea${ideas === 1 ? "" : "s"})`);
+    return people;
+  } catch (exc) {
+    logger.warning(`People: could not be found for job ${job.id} (${exc?.message ?? exc?.name ?? "error"})`);
+    return null;
+  } finally {
+    // Uploaded on a person's page: it is on their timeline even if the AI did not name them.
+    if (target) {
+      await linkJobToPerson(job.id, job.kind, target.id, aboutText(job, target.name)).catch((exc) =>
+        logger.warning(`People: could not add job ${job.id} to the person's timeline (${exc?.message ?? "error"})`),
+      );
+    }
+    // The bell: "Call analysed", new opportunities, people for the inbox (never fails the job).
+    await conversationDone(job.id).catch(() => 0);
+  }
 }
 
 /** Resolves when people extraction for a job has finished (or immediately if none is running). */

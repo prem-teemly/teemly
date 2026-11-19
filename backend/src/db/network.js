@@ -3,10 +3,10 @@
 // department, stage and score, the top connectors, and "say thank you" moments: a deal of someone a
 // connector introduced moved forward. All counted from the database; nothing is estimated.
 
-import * as config from "../config.js";
 import { getPool } from "./pool.js";
 import { chanceOf } from "./personWork.js";
 import { stageIndex } from "../stages.js";
+import { ownerName, uid } from "../tenant.js";
 
 const DAY = 86_400_000;
 const THANKS_DAYS = 21; // a forward move this recent is a good moment to thank the connector
@@ -21,11 +21,13 @@ const OPEN = (s) => s !== "Won" && s !== "Lost";
 /** The whole network: nodes, links, top connectors and thank-you moments. */
 export async function networkData({ now = Date.now() } = {}) {
   const db = getPool();
+  const user = uid();
   const [people] = await db.query(
     `SELECT id, name, category, role_title, organisation, city, departments, score, introduced_by_id, first_seen_at, last_contact_at
-       FROM people ORDER BY first_seen_at, id`,
+       FROM people WHERE user_id = ? ORDER BY first_seen_at, id`,
+    [user],
   );
-  const [opps] = await db.query("SELECT id, person_id, title, stage, value_inr, chance_pct FROM opportunities");
+  const [opps] = await db.query("SELECT id, person_id, title, stage, value_inr, chance_pct FROM opportunities WHERE user_id = ?", [user]);
 
   const byId = new Map(people.map((p) => [p.id, p]));
   const dealsOf = new Map();
@@ -101,7 +103,7 @@ export async function networkData({ now = Date.now() } = {}) {
     .sort((a, b) => b.value_inr - a.value_inr || b.direct + b.second_level - (a.direct + a.second_level))
     .slice(0, 6);
 
-  return { owner: config.AUTH.ownerName ?? "You", nodes, connectors, thanks: await thanksMoments({ now, byId, parentOf }) };
+  return { owner: ownerName(), nodes, connectors, thanks: await thanksMoments({ now, byId, parentOf }) };
 }
 
 /** Deals of introduced people that moved forward recently: a good moment to update and thank the connector. */
@@ -111,8 +113,8 @@ async function thanksMoments({ now, byId, parentOf }) {
     [rows] = await getPool().query(
       `SELECT c.id, c.from_stage, c.to_stage, c.changed_by, c.created_at, o.id AS opp_id, o.title, o.person_id
          FROM opportunity_stage_changes c JOIN opportunities o ON o.id = c.opportunity_id
-        WHERE c.from_stage IS NOT NULL AND c.created_at >= ? ORDER BY c.created_at DESC, c.id DESC LIMIT 200`,
-      [new Date(now - THANKS_DAYS * DAY)],
+        WHERE o.user_id = ? AND c.from_stage IS NOT NULL AND c.created_at >= ? ORDER BY c.created_at DESC, c.id DESC LIMIT 200`,
+      [uid(), new Date(now - THANKS_DAYS * DAY)],
     );
   } catch (exc) {
     if (exc?.code !== "ER_NO_SUCH_TABLE") throw exc;

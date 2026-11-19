@@ -7,8 +7,12 @@
 // Transcription failure fails the job. Diarization, analysis or Pulse failure does not: the job
 // completes and the result states clearly which part is unavailable and why.
 // Jobs are kept in memory (lost on restart). Up to JOB_CONCURRENCY jobs run at once.
+//
+// Every job belongs to the user who started it (job.owner): it runs, saves its results, finds its
+// people and makes its notifications as that user (tenant.runAs), and only that user can see it.
 
 import * as config from "../config.js";
+import { NoUserContext, currentUser, runAs, uid } from "../tenant.js";
 import * as analysis from "./analysis.js";
 import * as context from "./context.js";
 import * as diarization from "./diarization.js";
@@ -37,8 +41,10 @@ const STAGE_LABELS = {
 };
 
 class Job {
-  constructor({ id, filename, numSpeakers, kind = "audio", audio = null, probe = null, personId = null }) {
+  constructor({ id, owner, filename, numSpeakers, kind = "audio", audio = null, probe = null, personId = null }) {
+    if (!owner?.id) throw new NoUserContext();
     this.id = id;
+    this.owner = Object.freeze({ id: owner.id, name: owner.name }); // the user who started it
     this.personId = personId; // uploaded on this person's page (goes on their timeline)
     this.filename = filename;
     this.audio = audio; // public audio metadata (see repository.publicAudio)
@@ -120,7 +126,8 @@ function register(job) {
 const persistChains = new Map();
 function persist(job, fn) {
   if (!repo.enabled()) return;
-  const chain = (persistChains.get(job.id) ?? Promise.resolve()).then(fn, fn);
+  const asOwner = () => runAs(job.owner, fn);
+  const chain = (persistChains.get(job.id) ?? Promise.resolve()).then(asOwner, asOwner);
   persistChains.set(job.id, chain);
   chain.finally(() => {
     if (persistChains.get(job.id) === chain) persistChains.delete(job.id);
@@ -136,23 +143,30 @@ async function createJob(job, filePath, ip) {
   if (job.personId) await setJobPerson(job.id, job.personId).catch((exc) => logger.warning(`Could not link job ${job.id} to its person: ${exc.message}`));
 }
 
+/** Start a job for the current user (the one signed in on this request). */
 export function submit(filename, filePath, numSpeakers, { ip = null, audio = null, probe = null, personId = null } = {}) {
-  const job = new Job({ id: hexId(), filename, numSpeakers, audio, probe, personId });
+  const job = new Job({ id: hexId(), owner: currentUser(), filename, numSpeakers, audio, probe, personId });
   register(job);
   persist(job, () => createJob(job, filePath, ip));
-  enqueue(() => run(job, filePath));
+  enqueue(() => runAs(job.owner, () => run(job, filePath)));
   return job;
 }
 
-export const get = (jobId) => jobs.get(jobId) ?? null;
+/** One of the current user's in-memory jobs, or null. */
+export const get = (jobId) => {
+  const job = jobs.get(jobId);
+  return job && job.owner.id === uid() ? job : null;
+};
 
 /**
- * Jobs for the Today page's "Live" card: everything queued or processing, and what finished in the
- * last `withinSeconds` (so a call is seen to complete). Newest first; no results, only progress.
+ * The current user's jobs for the Today page's "Live" card: everything queued or processing, and what
+ * finished in the last `withinSeconds` (so a call is seen to complete). Newest first; no results, only progress.
  */
 export function recentJobs(withinSeconds = 900) {
   const t = now();
+  const user = uid();
   return [...jobs.values()]
+    .filter((j) => j.owner.id === user)
     .filter((j) => j.status === "queued" || j.status === "processing" || (j.finishedAt && t - j.finishedAt < withinSeconds))
     .sort((a, b) => b.createdAt - a.createdAt)
     .slice(0, 6)
@@ -162,17 +176,20 @@ export function recentJobs(withinSeconds = 900) {
     });
 }
 
-/** Stored upload names that a queued or processing job still reads (retention must keep these). */
+/** System: stored upload names that any queued or processing job still reads (retention must keep these). */
 export function filesInUse() {
   const names = new Set();
   for (const job of jobs.values()) if (job.status === "queued" || job.status === "processing") names.add(job.filename);
   return names;
 }
 
-/** A job from memory, or rebuilt from the database (e.g. after a backend restart). */
+/**
+ * One of the current user's jobs, from memory or rebuilt from the database (e.g. after a backend
+ * restart). Another user's job is "not found", exactly like a job that does not exist.
+ */
 export async function find(jobId) {
   const live = jobs.get(jobId);
-  if (live) return { live: true, job: live, dict: live.toDict() };
+  if (live) return live.owner.id === uid() ? { live: true, job: live, dict: live.toDict() } : null;
   const dict = await repo.loadJob(jobId);
   return dict ? { live: false, job: null, dict } : null;
 }

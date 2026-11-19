@@ -31,7 +31,39 @@ Application Default Credentials, so the project has no API keys.
 | **Departments** | Pipeline and people per department; the owner can add departments. |
 | **Network map, Notifications, PDF export, Settings** | |
 
-Sign-in is by email with a one-time code, for the owner only.
+## Accounts: one private room per user
+
+The first page is **Sign in / Create account**: email + password, or email + a one-time code (always
+available; "Forgot password?" sets a new password after a code). Every account
+has its own room: the calls it uploads, their transcripts, the people, inbox, opportunities,
+departments, notifications and settings belong to that account only. Prem's upload notifies Prem, never
+another account.
+
+```
+open the site ─► signed in? ──no──► /login ─► email (+ name to create an account) ─► 6-digit code
+                     │                                                              │
+                    yes ◄────────────── session cookie (7 days) ◄───────────────────┘
+                     │
+                     ▼
+              Today (their own dashboard)
+```
+
+How it is enforced:
+
+- **Database:** every table a user's data starts from has `user_id` (migration 023): `audio_files`,
+  `processing_jobs`, `people`, `person_suggestions`, `person_notes`, `opportunities`, `departments`,
+  `department_suggestions`, `notifications`, `notification_facts`, `app_settings`, `exports`,
+  `audio_uploads` (and `audit_logs`, who did it). Rows below them (transcripts, summaries, mentions, stage
+  changes...) are owned through their parent. Phone numbers and department names are unique per user.
+- **Backend:** a signed-in request runs as its user (`src/tenant.js`); every query filters by
+  `user_id = uid()`. Outside a user's context `uid()` throws, so a forgotten filter is an error, never a
+  leak. Background work (analysing a call, finding its people, the bell) runs as the job's owner.
+- **Tests:** `tests/auth.test.js` signs up two accounts and checks that neither can list, open, change
+  or delete the other's people, deals, calls, inbox, commitments, departments or notifications.
+
+Who can create an account: anyone by default; `SIGNUP_ALLOWED` limits it to some emails or domains,
+`SIGNUP_ENABLED=false` closes it. Data that existed before accounts is kept on one account, which the
+first sign-in with `OWNER_EMAIL` takes over.
 
 ## Server setup (production)
 
@@ -64,7 +96,7 @@ Create the database and its two least-privilege users from `backend/db/setup/cre
 cd backend
 npm ci
 cp .env.example .env       # fill it in (see below); never commit it
-npm run db:migrate         # creates / updates all tables (22 migrations)
+npm run db:migrate         # creates / updates all tables (23 migrations)
 ```
 
 ### 3. Configuration (`backend/.env`)
@@ -74,7 +106,9 @@ Every setting is documented in `backend/.env.example`. The ones that matter in p
 | Variable | Value |
 |---|---|
 | `NODE_ENV` | `production`: Secure cookie, API docs off, HSTS, and login codes never printed |
-| `OWNER_EMAIL`, `OWNER_NAME` | the owner's sign-in email and name. **The backend refuses to start in production without `OWNER_EMAIL`.** |
+| `SMTP_*` (below) | **required**: sign-up and sign-in codes are emailed |
+| `SIGNUP_ENABLED`, `SIGNUP_ALLOWED` | who can create an account: anyone (default), only listed emails / `@domains`, or nobody new |
+| `OWNER_EMAIL`, `OWNER_NAME` | optional: the first owner. Their first sign-in takes over the data from before accounts. |
 | `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASS`, `SMTP_FROM` | email for the sign-in codes (Gmail: an App Password) |
 | `DB_*`, `DB_MIGRATION_*` | the MySQL users from step 2 |
 | `AUDIT_HASH_KEY` | a long random string (32+ characters), new for this server |
@@ -122,12 +156,14 @@ like one client to the rate limits.
 ### 6. Check
 
 - `curl http://127.0.0.1:8000/health` returns `{"status":"success"}`.
-- The backend log shows `MySQL connected`, `Login: ON`, and the speaker models found.
-- Open the site, sign in with the owner email, upload a short call, and check that it appears in Inbox.
+- The backend log shows `MySQL connected`, `Login: ON, one room per account`, and the speaker models found.
+- Open the site: the first page is Sign in / Create account. Create an account, upload a short call,
+  and check that it appears in Inbox. Create a second account in a private window: its room is empty.
 
 ## Security and data
 
-- **Login:** every `/api` route needs a session, except `/health` and `/api/auth/*`.
+- **Login:** every `/api` route needs a session, except `/health` and `/api/auth/*`, and returns only the
+  signed-in account's data. The backend will not start without MySQL, or with `NODE_ENV=test`.
   - Codes expire in 5 minutes and allow 5 tries; resends are limited.
   - Sessions are an httpOnly, SameSite=Lax cookie (Secure in production).
 - **Code:** all SQL is parameterized.

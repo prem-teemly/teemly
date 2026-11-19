@@ -47,8 +47,11 @@ export const TRUSTED_PROXIES = list(env("TRUSTED_PROXIES", ""));
 // API docs (/docs, /redoc, /openapi.json): on in development, off in production unless API_DOCS=true.
 export const API_DOCS = ["1", "true", "yes"].includes(env("API_DOCS", process.env.NODE_ENV === "production" ? "false" : "true").trim().toLowerCase());
 
-// --- Login (email + one-time code). Login is ON only when OWNER_EMAIL is set: then every /api/* call
-// needs a session, and only these emails can sign in ("one owner, one room").
+// --- Accounts and sign-in (email + one-time code). Sign-in is always required: every /api/* call
+// except /health and /api/auth/* needs a session, and each account sees only its own room.
+// Sign-up: anyone can create an account (SIGNUP_ENABLED=true, the default) unless SIGNUP_ALLOWED lists
+// who may: emails ("ravi@gmail.com") and/or whole domains ("@teemly.co"). OWNER_EMAIL may always sign
+// up, and its first sign-in takes over the room that existed before accounts (migration 023).
 // The code is emailed through SMTP (e.g. Gmail with an App Password: SMTP_USER + SMTP_PASS).
 // OTP_PROVIDER: "auto" (default) = SMTP when SMTP_PASS is set, otherwise "console", which prints the
 // code in the backend terminal (development only; refused when NODE_ENV=production).
@@ -61,11 +64,15 @@ export const SMTP = {
   pass: smtpPass,
   from: env("SMTP_FROM", "").trim(),
 };
+const bool = (name, fallback) => ["1", "true", "yes", "on"].includes(env(name, String(fallback)).trim().toLowerCase());
 export const AUTH = {
+  // The first owner: may always sign up; takes over the room from before accounts (if there is one).
   ownerEmails: list(env("OWNER_EMAIL", "")).map((e) => e.toLowerCase()),
-  // Phone sign-in was replaced by email; still read only to explain a backend/.env not updated yet.
-  legacyOwnerPhones: list(env("OWNER_PHONE", "")),
-  ownerName: env("OWNER_NAME", "Owner").trim().slice(0, 80) || "Owner",
+  // Name for that account when OWNER_NAME is set (otherwise the name given at sign-up).
+  ownerName: env("OWNER_NAME", "").trim().slice(0, 80) || null,
+  signupEnabled: bool("SIGNUP_ENABLED", true),
+  // Who may create an account: emails and "@domain" entries; empty = anyone.
+  signupAllowed: list(env("SIGNUP_ALLOWED", "")).map((e) => e.toLowerCase()),
   otpProvider: otpSetting === "auto" ? (smtpPass ? "smtp" : "console") : otpSetting,
   otpTtlSeconds: int("OTP_TTL_SECONDS", 300),
   otpMaxAttempts: int("OTP_MAX_ATTEMPTS", 5),
@@ -76,7 +83,21 @@ export const AUTH = {
   // Secure cookies need HTTPS; on by default in production.
   cookieSecure: ["1", "true", "yes"].includes(env("COOKIE_SECURE", process.env.NODE_ENV === "production" ? "true" : "false").toLowerCase()),
 };
-export const authEnabled = () => AUTH.ownerEmails.length > 0;
+/** May this (normalised) email create an account? */
+export function canSignUp(email) {
+  if (AUTH.ownerEmails.includes(email)) return true;
+  if (!AUTH.signupEnabled) return false;
+  if (!AUTH.signupAllowed.length) return true;
+  const domain = `@${email.split("@")[1] ?? ""}`;
+  return AUTH.signupAllowed.includes(email) || AUTH.signupAllowed.includes(domain);
+}
+
+// Tests only: run every request as this user without a session (NODE_ENV=test and TEST_USER_ID set).
+// server.js refuses to start with NODE_ENV=test, so this can never apply to a running server.
+export function testUser() {
+  if (process.env.NODE_ENV !== "test" || !/^\d+$/.test(process.env.TEST_USER_ID ?? "")) return null;
+  return { id: Number(process.env.TEST_USER_ID), name: process.env.TEST_USER_NAME || "Test Owner", email: null, role: "owner", sessionId: 0 };
+}
 
 // --- Audio storage. "local" (default) keeps originals only in UPLOAD_DIR, exactly as before. "oci"
 // also stores every original in a private OCI Object Storage bucket (backend-only credentials); the

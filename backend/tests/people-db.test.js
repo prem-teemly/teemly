@@ -13,6 +13,10 @@ import path from "node:path";
 process.env.DB_NAME = "teemly_db_test";
 process.env.DB_ENABLED = "true";
 process.env.OWNER_NAME = "Prem";
+// Every request (and every job below) runs as test user 1, "Prem" (tests/helpers/no-login.js).
+process.env.TEST_USER_ID = "1";
+process.env.TEST_USER_NAME = "Prem";
+const OWNER = { id: 1, name: "Prem" };
 // Recordings for playback go to a temporary folder, never backend/uploads.
 const UPLOADS = mkdtempSync(path.join(tmpdir(), "teemly-people-"));
 process.env.UPLOAD_DIR = UPLOADS;
@@ -23,7 +27,8 @@ const { migrate } = await import("../src/db/migrate.js");
 const gemini = await import("../src/services/gemini.js");
 const { afterJob, peopleDone } = await import("../src/services/peopleJob.js");
 const { createApp } = await import("../src/app.js");
-const notes = await import("../src/db/notifications.js");
+const { asTestUser, ensureTestUser } = await import("./helpers/db-user.js");
+const notes = await asTestUser(await import("../src/db/notifications.js"));
 
 // The fake model answers with whatever the current test puts in `answer`.
 let answer = { people: [] };
@@ -38,21 +43,22 @@ const seg = (i, speaker, text, english) => ({ start: i * 3, end: i * 3 + 2, spea
 function call(id, segments) {
   return {
     id,
+    owner: OWNER,
     kind: "audio",
     status: "completed",
     result: { tamil_segments: segments.map(({ english, ...s }) => s), english_segments: segments.map((s) => ({ ...s, text: s.english })) },
   };
 }
 const msg = (index, sender, text) => ({ index, kind: "text", sender, timestamp: `2026-11-13T10:${String(index).padStart(2, "0")}:00`, text, english: text });
-const chat = (id, messages) => ({ id, kind: "whatsapp", status: "completed", result: { messages } });
+const chat = (id, messages) => ({ id, owner: OWNER, kind: "whatsapp", status: "completed", result: { messages } });
 
 const JOBS = { A: "a".repeat(32), B: "b".repeat(32), C: "c".repeat(32), D: "d".repeat(32), E: "e".repeat(32), F: "1".repeat(32), G: "2".repeat(32), H: "3".repeat(32), I: "4".repeat(32), J: "5".repeat(32), K: "6".repeat(32), L: "7".repeat(32), M: "8".repeat(32), N: "9".repeat(32), O: "0".repeat(31) + "a", P: "0".repeat(31) + "b", Q: "0".repeat(31) + "c", R: "0".repeat(31) + "d", S: "0".repeat(31) + "e", T: "0".repeat(30) + "2a", U: "0".repeat(30) + "1a" };
 async function seedJob(id, name, kind = "audio") {
   const [r] = await db.getPool().execute(
-    "INSERT INTO audio_files (stored_name, original_name, kind, file_format, size_bytes, sha256, duration_seconds) VALUES (?, ?, ?, ?, 1, ?, ?)",
+    "INSERT INTO audio_files (user_id, stored_name, original_name, kind, file_format, size_bytes, sha256, duration_seconds) VALUES (1, ?, ?, ?, ?, 1, ?, ?)",
     [`${id}.${kind === "audio" ? "wav" : "txt"}`, name, kind, kind === "audio" ? "wav" : "txt", "0".repeat(64), kind === "audio" ? 55.5 : null],
   );
-  await db.getPool().execute("INSERT INTO processing_jobs (id, audio_file_id, kind, status, stage) VALUES (?, ?, ?, 'completed', 'done')", [id, r.insertId, kind]);
+  await db.getPool().execute("INSERT INTO processing_jobs (user_id, id, audio_file_id, kind, status, stage) VALUES (1, ?, ?, ?, 'completed', 'done')", [id, r.insertId, kind]);
 }
 async function cleanup() {
   const ids = Object.values(JOBS);
@@ -92,6 +98,7 @@ before(async () => {
   const [[{ name }]] = await db.getPool().query("SELECT DATABASE() AS name");
   if (name !== "teemly_db_test") throw new Error(`refusing to run: connected to ${name}, not teemly_db_test`);
   await migrate({ log: () => {} });
+  await ensureTestUser(db.getPool(), OWNER);
   await cleanup();
   await seedJob(JOBS.A, "Call with Sanjay.m4a");
   await seedJob(JOBS.B, "Call with Arun.m4a");
@@ -498,7 +505,7 @@ test("Add file on a person's page: the call or chat goes on THEIR timeline (name
   // Lakshmi is in People; a second, different Lakshmi too.
   const mk = async (name, city) => {
     const [r] = await db.getPool().execute(
-      "INSERT INTO people (id, name, name_key, city, first_seen_at, last_contact_at, last_contact_kind) VALUES (?, ?, 'lakshmi', ?, UTC_TIMESTAMP(3), UTC_TIMESTAMP(3), 'audio')",
+      "INSERT INTO people (user_id, id, name, name_key, city, first_seen_at, last_contact_at, last_contact_kind) VALUES (1, ?, ?, 'lakshmi', ?, UTC_TIMESTAMP(3), UTC_TIMESTAMP(3), 'audio')",
       [name, "Lakshmi", city],
     );
     return r;
@@ -855,7 +862,7 @@ test("two people, one name, different departments: a call about the other depart
 test("a person's commitments: 5 at first, most pressing first, real due days, one line per promise, paged by view", async () => {
   const pid = "c".repeat(31) + "7";
   const now = new Date();
-  await q("INSERT INTO people (id, name, name_key, score, first_seen_at, last_contact_at, last_contact_kind) VALUES (?, 'Commitra', 'commitra', 50, ?, ?, 'audio')", [pid, now, now]);
+  await q("INSERT INTO people (user_id, id, name, name_key, score, first_seen_at, last_contact_at, last_contact_kind) VALUES (1, ?, 'Commitra', 'commitra', 50, ?, ?, 'audio')", [pid, now, now]);
   for (const job of [JOBS.T, JOBS.U]) await q("INSERT INTO person_mentions (person_id, job_id, relation, context, evidence_lines) VALUES (?, ?, 'participant', 'Talked.', '[]')", [pid, job]);
   // The first call was 5 days ago: its "today" was 5 days ago, not today.
   await q("UPDATE audio_files f JOIN processing_jobs j ON j.audio_file_id = f.id SET f.created_at = DATE_SUB(UTC_TIMESTAMP(3), INTERVAL 5 DAY) WHERE j.id = ?", [JOBS.T]);
@@ -989,7 +996,7 @@ test("opportunity panel: every deal by stage with its chance; moving a card is s
   const now = new Date();
   const old = new Date(Date.now() - 30 * 86_400_000);
   const pid = "e".repeat(31) + "1";
-  await q("INSERT INTO people (id, name, name_key, departments, score, first_seen_at, last_contact_at, last_contact_kind) VALUES (?, 'Board Tester', 'board tester', 'Investment', 70, ?, ?, 'audio')", [pid, now, now]);
+  await q("INSERT INTO people (user_id, id, name, name_key, departments, score, first_seen_at, last_contact_at, last_contact_kind) VALUES (1, ?, 'Board Tester', 'board tester', 'Investment', 70, ?, ?, 'audio')", [pid, now, now]);
   const mk = async (body) => (await api("POST", `/api/people/${pid}/opportunities`, body)).body.opportunity;
   const a = await mk({ title: "Seed round", department: "Investment", value_inr: 1000000, stage: "Identified" });
   const b = await mk({ title: "Bulk order", department: "Sales", value_inr: 200000, stage: "Pitch / bid shared", next_step: "Send quote", due_date: "2020-01-15" });
@@ -1029,8 +1036,8 @@ test("opportunity panel: every deal by stage with its chance; moving a card is s
 test("opportunity page: the deal, its person, every move, the introduction path; the owner's chance replaces the stage's until the stage changes", async () => {
   const now = new Date();
   const ids = { intro: "e".repeat(31) + "2", inv: "e".repeat(31) + "3" };
-  await q("INSERT INTO people (id, name, name_key, departments, score, first_seen_at, last_contact_at, last_contact_kind) VALUES (?, 'Page Introducer', 'page introducer', '', 60, ?, ?, 'audio')", [ids.intro, now, now]);
-  await q("INSERT INTO people (id, name, name_key, category, role_title, city, departments, score, introduced_by_id, first_seen_at, last_contact_at, last_contact_kind) VALUES (?, 'Page Investor', 'page investor', 'Investor', 'Angel investor', 'Chennai', 'Investment', 78, ?, ?, ?, 'audio')", [ids.inv, ids.intro, now, now]);
+  await q("INSERT INTO people (user_id, id, name, name_key, departments, score, first_seen_at, last_contact_at, last_contact_kind) VALUES (1, ?, 'Page Introducer', 'page introducer', '', 60, ?, ?, 'audio')", [ids.intro, now, now]);
+  await q("INSERT INTO people (user_id, id, name, name_key, category, role_title, city, departments, score, introduced_by_id, first_seen_at, last_contact_at, last_contact_kind) VALUES (1, ?, 'Page Investor', 'page investor', 'Investor', 'Angel investor', 'Chennai', 'Investment', 78, ?, ?, ?, 'audio')", [ids.inv, ids.intro, now, now]);
   const o = (await api("POST", `/api/people/${ids.inv}/opportunities`, { title: "Seed investment", department: "Investment", value_inr: 5000000, stage: "First contact", next_step: "Meeting on Monday" })).body.opportunity;
 
   let d = await api("GET", `/api/opportunities/${o.id}`);
@@ -1062,7 +1069,7 @@ test("today: needs attention, AI insights (only those already made), net stage m
   const now = new Date();
   const since = new Date(Date.now() - 3600_000).toISOString();
   const pid = "e".repeat(31) + "4";
-  await q("INSERT INTO people (id, name, name_key, departments, score, first_seen_at, last_contact_at, last_contact_kind) VALUES (?, 'Today Tester', 'today tester', 'Investment', 82, ?, ?, 'audio')", [pid, now, now]);
+  await q("INSERT INTO people (user_id, id, name, name_key, departments, score, first_seen_at, last_contact_at, last_contact_kind) VALUES (1, ?, 'Today Tester', 'today tester', 'Investment', 82, ?, ?, 'audio')", [pid, now, now]);
   const mk = async (body) => (await api("POST", `/api/people/${pid}/opportunities`, body)).body.opportunity;
   const a = await mk({ title: "Today seed", department: "Investment", value_inr: 2000000, stage: "Identified", next_step: "Send the deck", due_date: "2020-01-15" });
   const b = await mk({ title: "Today order", department: "Sales", value_inr: 300000, stage: "First contact" });
@@ -1075,7 +1082,7 @@ test("today: needs attention, AI insights (only those already made), net stage m
   const insight = { factors: [{ label: "Interest", level: "high", reason: "Asked for the deck", evidence: [] }], would_change: "Would move up after the deck is sent.", suggested_chance_pct: 40, details: {} };
   await q("INSERT INTO opportunity_insights (opportunity_id, data, based_on, model, created_at) VALUES (?, ?, '[]', 'test', ?)", [a.id, JSON.stringify(insight), now]);
   // The goal is set the way the owner sets it (Settings), so the department cache is refreshed too.
-  const [dept] = await q("SELECT id, goal_label, target_inr FROM departments WHERE slug = 'investment'");
+  const [dept] = await q("SELECT id, goal_label, target_inr FROM departments WHERE user_id = 1 AND slug = 'investment'");
   assert.equal((await api("POST", `/api/departments/${dept.id}`, { goal_label: "Seed round", target_inr: 10000000 })).status, 200);
   try {
     const r = await api("GET", `/api/today?since=${encodeURIComponent(since)}`);
@@ -1141,17 +1148,17 @@ test("notifications: facts from the room, each once; read / all read; settings s
   const yesterday = notes.localYmd(Date.now() - 86_400_000);
   await q("DELETE FROM notifications WHERE dedupe_key <> 'installed'"); // start from an empty bell
   await q("DELETE FROM app_settings");
-  await q("INSERT INTO people (id, name, name_key, departments, score, first_seen_at, last_contact_at, last_contact_kind) VALUES (?, 'Notify Tester', 'notify tester', 'Investment', 80, ?, ?, 'audio')", [pid, now, now]);
+  await q("INSERT INTO people (user_id, id, name, name_key, departments, score, first_seen_at, last_contact_at, last_contact_kind) VALUES (1, ?, 'Notify Tester', 'notify tester', 'Investment', 80, ?, ?, 'audio')", [pid, now, now]);
   // From a call: a new opportunity, and a later call moving it on.
   const oppId = "f".repeat(31) + "1";
-  await q("INSERT INTO opportunities (id, person_id, title, stage, department, value_inr, origin, evidence, created_at, updated_at) VALUES (?, ?, 'Notify seed', 'Negotiation', 'Investment', 2500000, 'ai', '[]', ?, ?)", [oppId, pid, now, now]);
+  await q("INSERT INTO opportunities (user_id, id, person_id, title, stage, department, value_inr, origin, evidence, created_at, updated_at) VALUES (1, ?, ?, 'Notify seed', 'Negotiation', 'Investment', 2500000, 'ai', '[]', ?, ?)", [oppId, pid, now, now]);
   await q("INSERT INTO opportunity_stage_changes (opportunity_id, from_stage, to_stage, changed_by, created_at) VALUES (?, 'In discussion', 'Negotiation', 'ai', ?)", [oppId, now]);
   // The owner's own deals with dates: one due today, one overdue (and the owner's moves are not announced).
   const mk = async (body) => (await api("POST", `/api/people/${pid}/opportunities`, body)).body.opportunity;
   const due = await mk({ title: "Notify due", value_inr: 100000, stage: "First contact", next_step: "Send the quote", due_date: ymd });
   const late = await mk({ title: "Notify late", stage: "In discussion", next_step: "Call back", due_date: yesterday });
   // Someone new found in a call, waiting in the inbox.
-  await q("INSERT INTO person_suggestions (id, job_id, name, name_key, relation, context, evidence, created_at) VALUES (?, ?, 'Notify Newbie', 'notify newbie', 'mentioned', 'Talked about.', '[]', ?)", ["d".repeat(31) + "1", JOBS.P, now]);
+  await q("INSERT INTO person_suggestions (user_id, id, job_id, name, name_key, relation, context, evidence, created_at) VALUES (1, ?, ?, 'Notify Newbie', 'notify newbie', 'mentioned', 'Talked about.', '[]', ?)", ["d".repeat(31) + "1", JOBS.P, now]);
 
   notes.resetForTests();
   let r = await api("GET", "/api/notifications");
@@ -1278,7 +1285,7 @@ test("notifications: facts from the room, each once; read / all read; settings s
 test("person's departments: the owner adds and removes them; a later call never puts back one the owner removed", async () => {
   const now = new Date();
   const pid = "e".repeat(31) + "6";
-  await q("INSERT INTO people (id, name, name_key, departments, score, first_seen_at, last_contact_at, last_contact_kind) VALUES (?, 'Deptedit Tester', 'deptedit tester', 'Investment', 60, ?, ?, 'audio')", [pid, now, now]);
+  await q("INSERT INTO people (user_id, id, name, name_key, departments, score, first_seen_at, last_contact_at, last_contact_kind) VALUES (1, ?, 'Deptedit Tester', 'deptedit tester', 'Investment', 60, ?, ?, 'audio')", [pid, now, now]);
   const set = (departments) => api("POST", `/api/people/${pid}/departments`, { departments });
   const stored = async () => (await q("SELECT departments, departments_removed FROM people WHERE id = ?", [pid]))[0];
 
@@ -1319,7 +1326,7 @@ test("person's departments: the owner adds and removes them; a later call never 
 test("add person by hand: saved with who introduced them, why, consent and a first opportunity; same name asks first; no call is made up", async () => {
   const now = new Date();
   const intro = "e".repeat(31) + "7";
-  await q("INSERT INTO people (id, name, name_key, departments, score, first_seen_at, last_contact_at, last_contact_kind) VALUES (?, 'Handadd Naveen', 'handadd naveen', '', 60, ?, ?, 'audio')", [intro, now, now]);
+  await q("INSERT INTO people (user_id, id, name, name_key, departments, score, first_seen_at, last_contact_at, last_contact_kind) VALUES (1, ?, 'Handadd Naveen', 'handadd naveen', '', 60, ?, ?, 'audio')", [intro, now, now]);
   const body = {
     name: "Handadd Ramesh",
     city: "Madurai",
@@ -1401,7 +1408,7 @@ test("referral network: who introduced whom (levels), top connectors with second
   const now = new Date();
   const ids = { a: "e".repeat(31) + "a", b: "e".repeat(31) + "b", c: "e".repeat(31) + "c" };
   const add = (id, name, intro, depts) =>
-    q("INSERT INTO people (id, name, name_key, departments, score, introduced_by_id, first_seen_at, last_contact_at, last_contact_kind) VALUES (?, ?, ?, ?, 70, ?, ?, ?, 'audio')", [id, name, name.toLowerCase(), depts, intro, now, now]);
+    q("INSERT INTO people (user_id, id, name, name_key, departments, score, introduced_by_id, first_seen_at, last_contact_at, last_contact_kind) VALUES (1, ?, ?, ?, ?, 70, ?, ?, ?, 'audio')", [id, name, name.toLowerCase(), depts, intro, now, now]);
   await add(ids.a, "Net Sanjay", null, "");
   await add(ids.b, "Net Meena", ids.a, "Investment");
   await add(ids.c, "Net Rajiv", ids.b, "Investment");
@@ -1457,9 +1464,9 @@ test("department dashboards: each department gets the dashboard for its work (ch
   // Sales data: a won deal, a lost one, one closing soon, one stalled for 30 days.
   const now = new Date();
   const ids = { a: "e".repeat(31) + "d", b: "e".repeat(31) + "e", c: "e".repeat(31) + "f" };
-  await q("INSERT INTO people (id, name, name_key, departments, city, score, first_seen_at, last_contact_at, last_contact_kind) VALUES (?, 'Dash Buyer', 'dash buyer', 'Sales', 'Madurai', 80, ?, ?, 'audio')", [ids.a, now, now]);
-  await q("INSERT INTO people (id, name, name_key, departments, city, score, introduced_by_id, first_seen_at, last_contact_at, last_contact_kind) VALUES (?, 'Dash Client', 'dash client', 'Sales', 'Chennai', 60, ?, ?, ?, 'audio')", [ids.b, ids.a, now, new Date(Date.now() - 20 * 86_400_000)]);
-  await q("INSERT INTO people (id, name, name_key, departments, score, first_seen_at, last_contact_at, last_contact_kind) VALUES (?, 'Dash Officer', 'dash officer', 'Govt tenders', 50, ?, ?, 'audio')", [ids.c, now, now]);
+  await q("INSERT INTO people (user_id, id, name, name_key, departments, city, score, first_seen_at, last_contact_at, last_contact_kind) VALUES (1, ?, 'Dash Buyer', 'dash buyer', 'Sales', 'Madurai', 80, ?, ?, 'audio')", [ids.a, now, now]);
+  await q("INSERT INTO people (user_id, id, name, name_key, departments, city, score, introduced_by_id, first_seen_at, last_contact_at, last_contact_kind) VALUES (1, ?, 'Dash Client', 'dash client', 'Sales', 'Chennai', 60, ?, ?, ?, 'audio')", [ids.b, ids.a, now, new Date(Date.now() - 20 * 86_400_000)]);
+  await q("INSERT INTO people (user_id, id, name, name_key, departments, score, first_seen_at, last_contact_at, last_contact_kind) VALUES (1, ?, 'Dash Officer', 'dash officer', 'Govt tenders', 50, ?, ?, 'audio')", [ids.c, now, now]);
   const mk = async (pid, body) => (await api("POST", `/api/people/${pid}/opportunities`, body)).body.opportunity;
   const soon = new Date(Date.now() + 3 * 86_400_000);
   const ymd = `${soon.getFullYear()}-${String(soon.getMonth() + 1).padStart(2, "0")}-${String(soon.getDate()).padStart(2, "0")}`;
@@ -1501,8 +1508,8 @@ test("startup housekeeping: uploads interrupted by a restart are marked failed (
   const authStore = await import("../src/auth/store.js");
   // A job that was "processing" when the server stopped.
   const id = "0".repeat(31) + "f";
-  const [f] = await db.getPool().execute("INSERT INTO audio_files (stored_name, original_name, kind, file_format, size_bytes, sha256) VALUES (?, 'Interrupted call.wav', 'audio', 'wav', 1, ?)", [`${id}.wav`, "0".repeat(64)]);
-  await q("INSERT INTO processing_jobs (id, audio_file_id, kind, status, stage) VALUES (?, ?, 'audio', 'processing', 'transcribing')", [id, f.insertId]);
+  const [f] = await db.getPool().execute("INSERT INTO audio_files (user_id, stored_name, original_name, kind, file_format, size_bytes, sha256) VALUES (1, ?, 'Interrupted call.wav', 'audio', 'wav', 1, ?)", [`${id}.wav`, "0".repeat(64)]);
+  await q("INSERT INTO processing_jobs (user_id, id, audio_file_id, kind, status, stage) VALUES (1, ?, ?, 'audio', 'processing', 'transcribing')", [id, f.insertId]);
   try {
     assert.ok((await repo.failInterruptedJobs()) >= 1);
     const [j] = await q("SELECT status, stage, error_message, finished_at FROM processing_jobs WHERE id = ?", [id]);

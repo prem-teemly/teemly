@@ -20,9 +20,9 @@ function describeFailure(e: unknown): string {
 }
 
 /**
- * Asks the backend who is signed in. When login is on and nobody is signed in, every page except
- * /login goes to /login; a signed-in user on /login goes to /people. The backend enforces the same
- * rule on every API call, so this only decides what to show.
+ * Asks the backend who is signed in. Nobody signed in: every page except /login goes to /login (sign
+ * in or create an account); a signed-in user on /login goes on to their room (Today, or the page they
+ * came from). The backend enforces the same rule on every API call, so this only decides what to show.
  *
  * The page is always rendered (hidden until the check passes) so the tree stays stable and Next.js can
  * prerender and validate each route. If the check fails, nothing is shown but the error: the app never
@@ -61,9 +61,11 @@ export default function AuthGate({ children }: { children: React.ReactNode }) {
       await logout();
     } finally {
       setAuth({ auth_enabled: true, user: null });
-      router.replace("/login");
+      // A full page load, not client navigation: nothing of this account (departments, lists kept in
+      // memory) can still be on screen for whoever signs in next on this browser.
+      window.location.replace("/login");
     }
-  }, [router]);
+  }, []);
 
   const onLogin = pathname === "/login";
   const mustSignIn = !!auth?.auth_enabled && !auth.user && !onLogin;
@@ -100,11 +102,12 @@ export default function AuthGate({ children }: { children: React.ReactNode }) {
   );
 }
 
-/** Where to go after sign-in: ?next= if it is a local path, otherwise /people. */
+/** Where to go after sign-in: ?next= if it is a local page, otherwise the dashboard (Today). */
 export function safeNext(): string {
   const next = typeof window === "undefined" ? null : new URLSearchParams(window.location.search).get("next");
   // Only a path on this site: browsers read "/\evil.com" (and other backslashes) like "//evil.com".
-  return next && next.startsWith("/") && !next.startsWith("//") && !next.includes("\\") && !/[\u0000-\u001f]/.test(next) && next !== "/login" ? next : "/people";
+  const local = !!next && next.startsWith("/") && !next.startsWith("//") && !next.includes("\\") && !/[\u0000-\u001f]/.test(next);
+  return local && next !== "/login" && next !== "/" ? next : "/today";
 }
 
 /** Bottom of the sidebar: the signed-in owner, with sign-out. */
@@ -120,7 +123,7 @@ export function SidebarUser() {
           </span>
           <span className="sb-user-text">
             <span className="sb-user-name">{user.name}</span>
-            <span className="sb-user-sub">Owner · private room</span>
+            <span className="sb-user-sub">Your private room</span>
           </span>
         </Link>
       ) : (
