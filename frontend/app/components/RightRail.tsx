@@ -1,5 +1,6 @@
 "use client";
 
+import Link from "next/link";
 import { formatClock } from "../lib/api";
 import type { CallView, Item } from "../lib/callView";
 import { CommitmentsCard, SummaryCard } from "./AnalysisCards";
@@ -105,8 +106,10 @@ function NewPeople({ state, view, onSeek }: Props) {
             <UserPlusIcon size={15} />
           </span>
           <div className="rr-person-main">
-            <p className="rr-person-name" title={p.name}>
-              {p.name}
+            <p className="rr-person-name">New person mentioned</p>
+            {/* What was said about them (the line of the call), not a name. */}
+            <p className="rr-person-quote" title={p.name}>
+              “{p.name}”
             </p>
             <p className="rr-person-sub">
               {p.timestamp != null && (
@@ -117,9 +120,10 @@ function NewPeople({ state, view, onSeek }: Props) {
               {p.context ? ` · ${p.context}` : ""}
             </p>
           </div>
-          <button type="button" className="rr-add" aria-disabled="true" title="Saving contacts is not available yet">
+          {/* New people from a call wait in the Inbox with the AI's department, deal and introducer: added there. */}
+          <Link href="/inbox" className="rr-add" title="Add them from the Inbox (with the department and deal from this call)">
             <UserPlusIcon size={15} /> Add
-          </button>
+          </Link>
         </section>
       ))}
     </>

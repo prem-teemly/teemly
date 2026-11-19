@@ -4248,6 +4248,16 @@ a.od-ev-src:hover {
   -webkit-box-orient: vertical;
   overflow: hidden;
 }
+.rr-person-quote {
+  margin: 2px 0 0;
+  font-size: 13px;
+  line-height: 1.45;
+  color: var(--or-text);
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
 .rr-person-sub {
   margin: 1px 0 0;
   font-size: 12.5px;
@@ -4280,6 +4290,13 @@ a.od-ev-src:hover {
 }
 .rr-add[aria-disabled] {
   cursor: default;
+}
+a.rr-add {
+  text-decoration: none;
+  cursor: pointer;
+}
+a.rr-add:hover {
+  background: var(--or-teal-dark);
 }
 .rr-outcome-row {
   display: flex;
@@ -4798,15 +4815,31 @@ a.sb-dept {
   align-items: center;
   gap: 6px;
 }
-.pg-size select {
-  height: 28px;
-  padding: 0 6px;
-  border: 1px solid #dfe3e8;
+/* Rows per page: the room's dropdown (SelectMenu), compact. It opens upward when the page ends below. */
+.pg-size .sm {
+  width: 72px;
+}
+.pg-size .sm-trigger {
+  min-height: 30px;
+  padding: 4px 8px 4px 10px;
   border-radius: 6px;
-  background: #fff;
-  font: inherit;
-  color: var(--or-text);
-  cursor: pointer;
+  font-size: 13px;
+  font-weight: 600;
+}
+.pg-size .sm-menu {
+  left: 0;
+  right: auto;
+  width: 120px;
+  min-width: 120px;
+}
+/* Numbers only: no colour-dot column, so the number has the room. */
+.pg-size .df-item {
+  grid-template-columns: minmax(0, 1fr) 14px;
+  gap: 8px;
+}
+.pg-size .df-item > span:first-child,
+.pg-size .df-item > span:nth-child(3) {
+  display: none;
 }
 .pg-pages {
   display: flex;

@@ -9,6 +9,7 @@ import FilterMenu, { type FilterOption } from "./FilterMenu";
 import { PlusIcon } from "./Icons";
 import PeopleChrome from "./PeopleChrome";
 import { DeptTag, PersonAvatar, ScorePill } from "./PeopleBits";
+import SelectMenu from "./SelectMenu";
 
 type View = "all" | "hot-investors" | "not-contacted" | "experts";
 const VIEWS: { id: View; label: string }[] = [
@@ -44,16 +45,15 @@ function Pagination({ page, pages, total, size, onPage, onSize }: { page: number
       <span className="pg-info">
         Showing {from}–{to} of {total}
       </span>
-      <label className="pg-size">
-        Rows
-        <select value={size} onChange={(e) => onSize(Number(e.target.value))} aria-label="Rows per page">
-          {PAGE_SIZES.map((s) => (
-            <option key={s} value={s}>
-              {s}
-            </option>
-          ))}
-        </select>
-      </label>
+      <div className="pg-size">
+        <span aria-hidden="true">Rows</span>
+        <SelectMenu
+          ariaLabel="Rows per page"
+          value={String(size)}
+          options={PAGE_SIZES.map((s) => ({ value: String(s), label: String(s) }))}
+          onChange={(v) => onSize(Number(v))}
+        />
+      </div>
       <div className="pg-pages">
         <button type="button" className="pg-btn" disabled={page <= 1} onClick={() => onPage(page - 1)} aria-label="Previous page">
           ‹ Prev
