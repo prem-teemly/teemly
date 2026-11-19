@@ -7,7 +7,8 @@ export type RoomSettings = {
   retention_hours: number;
   ai: { provider: string; transcribe_model: string; text_model: string; location: string };
   database: { connected: boolean; migrations: number | null };
-  login: { enabled: boolean; method?: "email"; code_delivery: "console" | "email"; session_days: number };
+  /** signup: who can create an account (open = anyone, restricted = SIGNUP_ALLOWED, closed = nobody new). */
+  login: { enabled: boolean; method?: "email"; code_delivery: "console" | "email"; session_days: number; signup?: "open" | "restricted" | "closed" };
   upload: { audio_formats: string[]; max_audio_mb: number };
 };
 

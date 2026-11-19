@@ -319,7 +319,7 @@ export function notFound(routes) {
 export function errorHandler(logger) {
   return (err, req, res, _next) => {
     if (err instanceof ValidationError) return sendJson(res, 422, { detail: err.detail });
-    if (err instanceof HttpError) return sendJson(res, err.status, { status: "error", message: err.message });
+    if (err instanceof HttpError) return sendJson(res, err.status, { status: "error", message: err.message, ...(err.code ? { code: err.code } : {}) });
     logger.error(`Unhandled error for ${req.method} ${req.originalUrl}`, err);
     const body = Buffer.from("Internal Server Error");
     res.statusCode = 500;

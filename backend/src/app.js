@@ -25,7 +25,7 @@ export function createApp() {
   app.use(securityHeaders);
   app.use(cors);
   app.use(rateLimit());
-  app.use(requireAuth); // only when login is enabled (OWNER_PHONE set)
+  app.use(requireAuth); // every API except /health and /api/auth/*: signed in, and runs as that user
   app.use(router);
 
   // Interactive API docs: development only (API_DOCS), so production does not describe its API to

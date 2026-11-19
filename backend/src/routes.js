@@ -32,6 +32,7 @@ import * as networkDb from "./db/network.js";
 import { InsightUnavailable } from "./services/opportunityInsight.js";
 import { BUILT_IN as BUILT_IN_DEPARTMENTS, departmentNames } from "./db/departments.js";
 import { STAGES, normalizeStage } from "./stages.js";
+import { ownerName, runAs, uid } from "./tenant.js";
 import { HttpError, getLogger, hexId } from "./util.js";
 
 const loggers = {
@@ -51,12 +52,23 @@ const MAX_TEXT_CHARS = 200_000;
 
 const isFile = (p) => existsSync(p) && statSync(p).isFile();
 
-// Uploads accepted by this process: checksum of the stored file and its public metadata, so a job
-// start needs no second ffprobe run (after a restart the database copy is used instead).
+// Uploads accepted by this process: who uploaded it, the checksum of the stored file and its public
+// metadata, so a job start needs no second ffprobe run (after a restart the database copy is used instead).
 const uploaded = new Map();
 function rememberUpload(storedName, info) {
-  uploaded.set(storedName, info);
+  uploaded.set(storedName, { ...info, owner: uid() });
   if (uploaded.size > 500) uploaded.delete(uploaded.keys().next().value);
+}
+
+/**
+ * A stored upload may only be transcribed or analysed by the user who uploaded it. Someone else's
+ * file is "not found", exactly like a file that does not exist.
+ */
+async function assertOwnUpload(filename) {
+  const known = uploaded.get(filename);
+  const mine = known ? known.owner === uid() : await repo.ownsFile(filename);
+  // null = no owner on record: only possible without MySQL (tests), where there is one user.
+  if (mine === false || (mine === null && repo.enabled())) throw new HttpError(404, `Uploaded file '${filename}' was not found.`);
 }
 const startsWith = (buf, sig) => buf.length >= sig.length && buf.subarray(0, sig.length).equals(Buffer.from(sig));
 
@@ -127,8 +139,14 @@ async function trackRejection(kind, req, file, fn) {
   }
 }
 
-/** Wrap async handlers so rejections reach the error middleware. */
-const h = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
+/**
+ * Wrap async handlers so rejections reach the error middleware, and run them as the signed-in user
+ * (req.user, set by requireAuth): every query they make is limited to that user's room.
+ */
+const h = (fn) => (req, res, next) => {
+  const run = () => Promise.resolve(fn(req, res, next));
+  return (req.user ? runAs(req.user, run) : run()).catch(next);
+};
 
 export const router = Router();
 
@@ -224,6 +242,7 @@ route(
     if (!STORED_FILENAME_PATTERN.test(filename)) {
       throw new HttpError(400, "Invalid filename. Use the 'filename' value returned by POST /api/audio/upload.");
     }
+    await assertOwnUpload(filename);
     const filePath = path.join(UPLOAD_DIR, filename);
     if (!isFile(filePath)) throw new HttpError(404, `Uploaded file '${filename}' was not found.`);
 
@@ -271,6 +290,7 @@ route(
     if (!STORED_FILENAME_PATTERN.test(filename)) {
       throw new HttpError(400, "Invalid filename. Use the 'filename' value returned by POST /api/audio/upload.");
     }
+    await assertOwnUpload(filename);
     let filePath = path.join(UPLOAD_DIR, filename);
     if (!isFile(filePath)) {
       // Not on this server (e.g. only in OCI): fetch a checksum-verified working copy.
@@ -510,7 +530,7 @@ route(
   "/api/people/:person_id",
   h(async (req, res) => {
     const id = personId(req);
-    const found = await peopleStore().getPerson(id, { ownerName: config.AUTH.ownerName });
+    const found = await peopleStore().getPerson(id, { ownerName: ownerName() });
     if (!found) throw new HttpError(404, "Person not found.");
     const [notes, opportunities] = await Promise.all([workDb.listNotes(id), workDb.listOpportunities(id)]);
     return sendJson(res, 200, { status: "success", ...found, notes, opportunities });
@@ -607,7 +627,7 @@ route(
     const limit = q.limit === undefined ? peopleDb.COMMITMENTS_FIRST : Number(q.limit);
     if (!Number.isInteger(offset) || offset < 0 || offset > 100000) throw new HttpError(422, "offset: should be a whole number, 0 or more");
     if (!Number.isInteger(limit) || limit < 1 || limit > peopleDb.COMMITMENTS_MAX_PAGE) throw new HttpError(422, `limit: should be 1 to ${peopleDb.COMMITMENTS_MAX_PAGE}`);
-    const page = await peopleStore().personCommitments(id, { ownerName: config.AUTH.ownerName, view, offset, limit });
+    const page = await peopleStore().personCommitments(id, { ownerName: ownerName(), view, offset, limit });
     if (!page) throw new HttpError(404, "Person not found.");
     return sendJson(res, 200, { status: "success", ...page });
   }),
@@ -1285,7 +1305,13 @@ route(
       retention_hours: config.UPLOAD_RETENTION_HOURS, // 0 = keep recordings
       ai: { provider: "Google Gemini (Vertex AI)", transcribe_model: config.settings.GEMINI_TRANSCRIBE_MODEL, text_model: config.settings.GEMINI_TEXT_MODEL, location: config.GOOGLE_CLOUD_LOCATION },
       database: { connected: Boolean(st.connected), migrations: Array.isArray(st.migrations) ? st.migrations.length : null },
-      login: { enabled: config.authEnabled(), method: "email", code_delivery: config.AUTH.otpProvider === "console" ? "console" : "email", session_days: config.AUTH.sessionDays },
+      login: {
+        enabled: true,
+        method: "email",
+        code_delivery: config.AUTH.otpProvider === "console" ? "console" : "email",
+        session_days: config.AUTH.sessionDays,
+        signup: config.AUTH.signupEnabled ? (config.AUTH.signupAllowed.length ? "restricted" : "open") : "closed",
+      },
       upload: { audio_formats: SUPPORTED_FORMATS, max_audio_mb: MAX_UPLOAD_SIZE_MB },
     });
   }),
@@ -1297,7 +1323,8 @@ route(
   "GET",
   "/api/db/status",
   h(async (req, res) => {
+    // Any account can ask, so only whether it works: never the server's host, user or database name.
     const st = await db.status();
-    return sendJson(res, 200, { status: st.connected ? "success" : "error", ...st });
+    return sendJson(res, 200, { status: st.connected ? "success" : "error", connected: st.connected, server_version: st.server_version, migrations: st.migrations.length, error: st.connected ? null : "The database is not reachable." });
   }),
 );

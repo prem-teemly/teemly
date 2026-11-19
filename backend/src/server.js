@@ -10,24 +10,24 @@ import { assertStrongHashKey } from "./auth/phone.js";
 import * as authStore from "./auth/store.js";
 import * as repo from "./db/repository.js";
 
-// Login moved from phone to email: a backend/.env that still only names an owner phone would start
-// with login OFF (an open room), so refuse and say what to set instead.
-if (!config.authEnabled() && config.AUTH.legacyOwnerPhones.length) {
-  process.stderr.write("ERROR:    Sign-in is by email now. Set OWNER_EMAIL in backend/.env (the owner's email), then start again.\n");
+const fail = (message) => {
+  process.stderr.write(`ERROR:    ${message}\n`);
   process.exit(1);
-}
+};
 
-// Production never runs as an open room: without OWNER_EMAIL every person, recording and export would be
-// readable by anyone who can reach the server. Fail closed instead of starting with login off.
-if (process.env.NODE_ENV === "production" && !config.authEnabled()) {
-  process.stderr.write("ERROR:    NODE_ENV=production but login is OFF. Set OWNER_EMAIL (and SMTP_* to email the codes) in backend/.env, then start again.\n");
-  process.exit(1);
-}
+// NODE_ENV=test lets the tests run requests as a fixed user without signing in (config.testUser): a
+// real server must never start that way.
+if (process.env.NODE_ENV === "test") fail("NODE_ENV=test is only for the automated tests. Use NODE_ENV=production on a server (or leave it unset on this computer).");
 
-// Login: refuse to start with an unsafe setup (e.g. codes printed in the terminal in production).
-if (config.authEnabled()) {
+// Every user has their own room, kept in MySQL: without it nobody could sign in.
+if (!db.isConfigured()) fail("Accounts need the database. Set DB_USER / DB_PASSWORD (and run npm run db:migrate) in backend/.env, then start again.");
+
+// Sign-in: refuse to start with an unsafe setup (e.g. codes printed in the terminal in production).
+try {
   assertProviderAllowed(config.AUTH.otpProvider);
   assertStrongHashKey();
+} catch (exc) {
+  fail(exc.message);
 }
 
 startRetention(); // only deletes uploads if UPLOAD_RETENTION_HOURS is set (off by default)
@@ -49,10 +49,10 @@ const server = createApp().listen(config.PORT, config.HOST, () => {
       : `MySQL persistence is OFF: ${st.error}`;
     process.stdout.write(`INFO:     ${line}\n`);
     process.stdout.write(`INFO:     ${storage.describe()}\n`);
-    const login = config.authEnabled()
-      ? `Login: ON (${config.AUTH.ownerEmails.length} owner email(s), codes ${config.AUTH.otpProvider === "smtp" ? `emailed via ${config.SMTP.host}` : "printed here (console, no email: set SMTP_PASS to email them)"})`
-      : "Login: OFF (set OWNER_EMAIL in .env to require sign-in)";
-    process.stdout.write(`INFO:     ${login}\n`);
+    const signup = config.AUTH.signupEnabled ? (config.AUTH.signupAllowed.length ? `sign-up for ${config.AUTH.signupAllowed.length} allowed email(s)/domain(s)` : "anyone can sign up") : "sign-up closed";
+    const codes = config.AUTH.otpProvider === "smtp" ? `emailed via ${config.SMTP.host}` : "printed here (console, no email: set SMTP_PASS to email them)";
+    process.stdout.write(`INFO:     Login: ON, one room per account (${signup}; codes ${codes})\n`);
+    if (st.connected && !st.migrations.some((m) => m.version === 23)) process.stdout.write("WARNING:  Accounts need migration 023: run npm run db:migrate, then restart.\n");
     // On a public server NODE_ENV must be production (Secure cookie, API docs off, HSTS).
     if (process.env.NODE_ENV !== "production") process.stdout.write("WARNING:  NODE_ENV is not 'production': fine on this computer; on a hosted server set NODE_ENV=production.\n");
   });

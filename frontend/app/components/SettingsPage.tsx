@@ -391,7 +391,14 @@ function SecurityTab({ s, profile }: { s: RoomSettings; profile: Profile | null 
     <div className="st-grid">
       <Card title="Sign-in">
         <ul className="st-rows">
-          <Row title="Method" sub="Email + one-time code (owner only)" right={<Status kind={s.login.enabled ? "on" : "off"}>{s.login.enabled ? "On" : "Off"}</Status>} />
+          <Row title="Method" sub="Email + password, or email + one-time code · every account has its own private room" right={<Status kind={s.login.enabled ? "on" : "off"}>{s.login.enabled ? "On" : "Off"}</Status>} />
+          {s.login.signup && (
+            <Row
+              title="New accounts"
+              sub={s.login.signup === "open" ? "Anyone with an email can create an account" : s.login.signup === "restricted" ? "Only the emails and domains in SIGNUP_ALLOWED can create an account" : "Sign-up is closed (SIGNUP_ENABLED=false)"}
+              right={<Status kind={s.login.signup === "closed" ? "off" : "on"}>{s.login.signup === "open" ? "Open" : s.login.signup === "restricted" ? "Restricted" : "Closed"}</Status>}
+            />
+          )}
           <Row
             title="Codes"
             sub={s.login.code_delivery === "console" ? "Shown in the backend terminal (development mode, no email sent)" : "Sent to your email"}

@@ -27,12 +27,13 @@ export function codeMatches(challengeId, code, storedHash) {
   return a.length === b.length && timingSafeEqual(a, b);
 }
 
-/** The sign-in email (plain text and HTML). The code is the only secret in it. */
-export function codeEmail(code, ttlSeconds, ownerName = config.AUTH.ownerName) {
+/** The sign-in email (plain text and HTML). The code is the only secret in it. `name`: the account's, if known. */
+export function codeEmail(code, ttlSeconds, name = null) {
   const minutes = Math.round(ttlSeconds / 60);
   const subject = `${code} is your Teemly sign-in code`;
+  const hi = name ? `Hi ${name},` : "Hi,";
   const text = [
-    `Hi ${ownerName},`,
+    hi,
     "",
     `Your Teemly sign-in code is: ${code}`,
     "",
@@ -43,7 +44,7 @@ export function codeEmail(code, ttlSeconds, ownerName = config.AUTH.ownerName) {
   const html = `<!doctype html><html><body style="margin:0;padding:24px;background:#f5f7fa;font-family:Segoe UI,Arial,sans-serif;color:#1f2937">
 <div style="max-width:420px;margin:0 auto;background:#fff;border:1px solid #e6e9ee;border-radius:12px;padding:24px">
 <p style="margin:0 0 4px;font-size:13px;color:#138d8f;font-weight:700">Teemly Opportunity Room</p>
-<p style="margin:0 0 16px;font-size:15px">Hi ${escapeHtml(ownerName)}, your sign-in code is:</p>
+<p style="margin:0 0 16px;font-size:15px">${escapeHtml(hi)} your sign-in code is:</p>
 <p style="margin:0 0 16px;font-size:32px;font-weight:700;letter-spacing:8px;color:#14213d">${code}</p>
 <p style="margin:0;font-size:13px;color:#6b7280">It expires in ${minutes} minutes and works once. If you did not try to sign in, ignore this email: nobody can sign in without the code.</p>
 </div></body></html>`;
@@ -74,8 +75,8 @@ const PROVIDERS = {
   },
   /** Email through SMTP (Gmail: smtp.gmail.com, port 465, the account and an App Password). */
   smtp: {
-    async send(email, code, ttlSeconds) {
-      const { subject, text, html } = codeEmail(code, ttlSeconds);
+    async send(email, code, ttlSeconds, name) {
+      const { subject, text, html } = codeEmail(code, ttlSeconds, name);
       await smtpTransport().sendMail({ from: config.SMTP.from || `Teemly <${config.SMTP.user}>`, to: email, subject, text, html });
       return { delivered: true, channel: "email" };
     },
@@ -94,9 +95,9 @@ export function assertProviderAllowed(name, env = process.env.NODE_ENV) {
 }
 
 /** Send a code. Throws when the email could not be sent (the caller tells the user to try again). */
-export async function sendCode(provider, email, code, ttlSeconds) {
+export async function sendCode(provider, email, code, ttlSeconds, name = null) {
   assertProviderAllowed(provider);
-  const r = await PROVIDERS[provider].send(email, code, ttlSeconds);
+  const r = await PROVIDERS[provider].send(email, code, ttlSeconds, name);
   logger.info(`Sign-in code sent to ${maskEmail(email)} via ${r.channel}`); // never the code itself
   return r;
 }

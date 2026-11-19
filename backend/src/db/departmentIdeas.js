@@ -5,6 +5,7 @@
 import { getPool, withTransaction } from "./pool.js";
 import { WorkError } from "./personWork.js";
 import { createDepartment, listDepartments, parseDepartment } from "./departments.js";
+import { uid } from "../tenant.js";
 import { hexId } from "../util.js";
 
 const iso = (d) => (d instanceof Date ? d.toISOString() : d ? new Date(d).toISOString() : null);
@@ -23,16 +24,17 @@ async function existing(name) {
  */
 export async function recordDepartmentIdeas(jobId, ideas) {
   if (!ideas?.length) return 0;
+  const user = uid();
   let added = 0;
   for (const idea of ideas) {
     if (await existing(idea.name)) continue;
     const done = await withTransaction(async (conn) => {
-      const [[same]] = await conn.execute("SELECT id FROM department_suggestions WHERE name_key = ? AND (status = 'pending' OR job_id = ?) LIMIT 1 FOR UPDATE", [idea.key, jobId]);
+      const [[same]] = await conn.execute("SELECT id FROM department_suggestions WHERE user_id = ? AND name_key = ? AND (status = 'pending' OR job_id = ?) LIMIT 1 FOR UPDATE", [user, idea.key, jobId]);
       if (same) return false;
       await conn.execute(
-        `INSERT INTO department_suggestions (id, job_id, name, name_key, description, reason, said_by, evidence, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-        [hexId(), jobId, idea.name, idea.key, idea.description, idea.reason, idea.said_by || null, JSON.stringify(idea.evidence ?? []), new Date()],
+        `INSERT INTO department_suggestions (id, user_id, job_id, name, name_key, description, reason, said_by, evidence, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [hexId(), user, jobId, idea.name, idea.key, idea.description, idea.reason, idea.said_by || null, JSON.stringify(idea.evidence ?? []), new Date()],
       );
       return true;
     });
@@ -49,9 +51,9 @@ export async function listDepartmentIdeas(status = "pending") {
     `SELECT s.*, j.kind, f.original_name, d.slug AS department_slug
        FROM department_suggestions s
        JOIN processing_jobs j ON j.id = s.job_id JOIN audio_files f ON f.id = j.audio_file_id
-       LEFT JOIN departments d ON d.id = s.department_id
-      WHERE s.status = ? ORDER BY s.created_at DESC LIMIT 100`,
-    [STATUS[status] ?? "pending"],
+       LEFT JOIN departments d ON d.id = s.department_id AND d.user_id = s.user_id
+      WHERE s.user_id = ? AND s.status = ? ORDER BY s.created_at DESC LIMIT 100`,
+    [uid(), STATUS[status] ?? "pending"],
   );
   return rows.map((r) => ({
     id: r.id,
@@ -70,15 +72,16 @@ export async function listDepartmentIdeas(status = "pending") {
 
 export async function pendingIdeasCount() {
   try {
-    const [[r]] = await getPool().query("SELECT COUNT(*) AS n FROM department_suggestions WHERE status = 'pending'");
+    const [[r]] = await getPool().query("SELECT COUNT(*) AS n FROM department_suggestions WHERE user_id = ? AND status = 'pending'", [uid()]);
     return Number(r.n);
-  } catch {
-    return 0; // migration 013 not applied yet
+  } catch (exc) {
+    if (exc?.code === "ER_NO_SUCH_TABLE") return 0; // migration 013 not applied yet
+    throw exc;
   }
 }
 
 async function lockPending(conn, id) {
-  const [[s]] = await conn.execute("SELECT * FROM department_suggestions WHERE id = ? FOR UPDATE", [id]);
+  const [[s]] = await conn.execute("SELECT * FROM department_suggestions WHERE id = ? AND user_id = ? FOR UPDATE", [id, uid()]);
   if (!s) throw new WorkError(404, "This suggestion was not found.");
   if (s.status !== "pending") throw new WorkError(409, `This suggestion was already ${s.status === "created" ? "created" : "ignored"}.`);
   return s;
@@ -94,13 +97,13 @@ export async function createFromIdea(id, edits = {}) {
   const clash = await existing(data.name);
   if (clash) throw new WorkError(409, `A department called "${clash.name}" already exists.`);
   const dept = await createDepartment(data);
-  await getPool().execute("UPDATE department_suggestions SET status = 'created', department_id = ?, decided_at = UTC_TIMESTAMP(3) WHERE id = ? AND status = 'pending'", [dept.id, id]);
+  await getPool().execute("UPDATE department_suggestions SET status = 'created', department_id = ?, decided_at = UTC_TIMESTAMP(3) WHERE id = ? AND user_id = ? AND status = 'pending'", [dept.id, id, uid()]);
   return dept;
 }
 
 export async function ignoreIdea(id) {
   await withTransaction(async (conn) => {
     await lockPending(conn, id);
-    await conn.execute("UPDATE department_suggestions SET status = 'ignored', decided_at = UTC_TIMESTAMP(3) WHERE id = ?", [id]);
+    await conn.execute("UPDATE department_suggestions SET status = 'ignored', decided_at = UTC_TIMESTAMP(3) WHERE id = ? AND user_id = ?", [id, uid()]);
   });
 }

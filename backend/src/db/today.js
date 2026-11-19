@@ -3,8 +3,8 @@
 // follow-ups and the pipeline by department. Everything is counted from the database (and the jobs
 // running now); nothing is estimated except the stage chance, which is the panel's.
 
-import * as config from "../config.js";
 import { getPool } from "./pool.js";
+import { ownerName, uid } from "../tenant.js";
 import { departmentDetail, departmentOverview } from "./departments.js";
 import { opportunityBoard } from "./opportunityBoard.js";
 import { STAGE_CHANCE, stageIndex } from "../stages.js";
@@ -59,17 +59,20 @@ export { dueFromWords };
  */
 export async function followUpsPage({ offset = 0, limit = FOLLOW_UPS_FIRST, now = Date.now() } = {}) {
   const db = getPool();
+  const user = uid();
   const todayYmd = localYmd(now); // the owner's day (APP_TIMEZONE)
   // DATE columns come back as UTC midnight (pool timezone "Z").
   const ymd = (v) => (v instanceof Date ? v.toISOString().slice(0, 10) : v ? String(v).slice(0, 10) : null);
   const [dealKeys] = await db.query(
-    "SELECT o.id, o.due_date, UNIX_TIMESTAMP(o.updated_at) AS at FROM opportunities o WHERE o.stage NOT IN ('Won','Lost') AND o.next_step IS NOT NULL AND o.next_step <> ''",
+    "SELECT o.id, o.due_date, UNIX_TIMESTAMP(o.updated_at) AS at FROM opportunities o WHERE o.user_id = ? AND o.stage NOT IN ('Won','Lost') AND o.next_step IS NOT NULL AND o.next_step <> ''",
+    [user],
   );
   const [promiseKeys] = await db.query(
     `SELECT a.id, a.date_text, a.deadline_text, a.seq, UNIX_TIMESTAMP(f.created_at) AS at
        FROM action_items a JOIN summaries s ON s.id = a.summary_id
        JOIN processing_jobs j ON j.id = s.job_id JOIN audio_files f ON f.id = j.audio_file_id
-      WHERE a.status = 'open'`,
+      WHERE j.user_id = ? AND a.status = 'open'`,
+    [user],
   );
   const keyed = [
     ...dealKeys.map((r) => ({ kind: "deal", ref: r.id, due: ymd(r.due_date), at: Number(r.at), seq: 0 })),
@@ -100,8 +103,8 @@ export async function followUpsPage({ offset = 0, limit = FOLLOW_UPS_FIRST, now 
     const [d] = await db.query(
       `SELECT o.id, o.title, o.stage, o.department, o.value_inr, o.next_step, o.due_date,
               p.id AS person_id, p.name, p.role_title, p.organisation, p.city, p.category
-         FROM opportunities o JOIN people p ON p.id = o.person_id WHERE o.id IN (?)`,
-      [dealIds],
+         FROM opportunities o JOIN people p ON p.id = o.person_id AND p.user_id = o.user_id WHERE o.user_id = ? AND o.id IN (?)`,
+      [user, dealIds],
     );
     for (const r of d) deals.set(r.id, r);
   }
@@ -111,19 +114,21 @@ export async function followUpsPage({ offset = 0, limit = FOLLOW_UPS_FIRST, now 
     const [a] = await db.query(
       `SELECT a.id, a.task, a.responsible_person, a.date_text, a.deadline_text, s.job_id, f.original_name, UNIX_TIMESTAMP(f.created_at) AS epoch
          FROM action_items a JOIN summaries s ON s.id = a.summary_id
-         JOIN processing_jobs j ON j.id = s.job_id JOIN audio_files f ON f.id = j.audio_file_id WHERE a.id IN (?)`,
-      [promiseIds],
+         JOIN processing_jobs j ON j.id = s.job_id JOIN audio_files f ON f.id = j.audio_file_id WHERE j.user_id = ? AND a.id IN (?)`,
+      [user, promiseIds],
     );
     for (const r of a) promises.set(Number(r.id), r);
-    const [m] = await db.query(
-      `SELECT m.job_id, p.id, p.name, p.role_title, p.organisation, p.city, p.category FROM person_mentions m JOIN people p ON p.id = m.person_id
-        WHERE m.job_id IN (?) ORDER BY m.relation = 'participant' DESC, m.id`,
-      [[...new Set(a.map((r) => r.job_id))]],
-    );
-    for (const r of m) if (!jobPeople.has(r.job_id)) jobPeople.set(r.job_id, personOf(r));
+    if (a.length) {
+      const [m] = await db.query(
+        `SELECT m.job_id, p.id, p.name, p.role_title, p.organisation, p.city, p.category FROM person_mentions m JOIN people p ON p.id = m.person_id
+          WHERE p.user_id = ? AND m.job_id IN (?) ORDER BY m.relation = 'participant' DESC, m.id`,
+        [user, [...new Set(a.map((r) => r.job_id))]],
+      );
+      for (const r of m) if (!jobPeople.has(r.job_id)) jobPeople.set(r.job_id, personOf(r));
+    }
   }
 
-  const owner = firstName(config.AUTH.ownerName);
+  const owner = firstName(ownerName());
   const items = rows
     .map((r) => {
       if (r.kind === "deal") {
@@ -187,21 +192,22 @@ const URGENCY_SQL = `CASE WHEN o.due_date IS NULL THEN 1 WHEN o.due_date < ? THE
  */
 export async function topOpportunitiesPage({ offset = 0, limit = TOP_FIRST, now = Date.now() } = {}) {
   const db = getPool();
+  const user = uid();
   const todayYmd = new Date(now).toISOString().slice(0, 10); // as the panel's "overdue"
-  const OPEN = "o.stage NOT IN ('Won','Lost')";
-  const [[{ n }]] = await db.query(`SELECT COUNT(*) AS n FROM opportunities o WHERE ${OPEN}`);
+  const OPEN = "o.user_id = ? AND o.stage NOT IN ('Won','Lost')";
+  const [[{ n }]] = await db.query(`SELECT COUNT(*) AS n FROM opportunities o WHERE ${OPEN}`, [user]);
   const total = Number(n);
   const [rows] = await db.query(
     `SELECT o.id, o.title, o.stage, o.department, o.value_inr, o.chance_pct, o.next_step, o.due_date, o.evidence,
             p.id AS person_id, p.name AS person_name, p.score,
             ROUND(COALESCE(o.value_inr, 0) * ${CHANCE_SQL} * ${URGENCY_SQL}) AS rank_value
-       FROM opportunities o JOIN people p ON p.id = o.person_id
+       FROM opportunities o JOIN people p ON p.id = o.person_id AND p.user_id = o.user_id
       WHERE ${OPEN}
       ORDER BY rank_value DESC, p.score DESC, o.updated_at DESC, o.id
       LIMIT ? OFFSET ?`,
-    [todayYmd, todayYmd, todayYmd, limit, offset],
+    [todayYmd, todayYmd, todayYmd, user, limit, offset],
   );
-  const ownerFirst = firstName(config.AUTH.ownerName);
+  const ownerFirst = firstName(ownerName());
   const items = rows.map((r) => {
     const due = r.due_date instanceof Date ? r.due_date.toISOString().slice(0, 10) : r.due_date ? String(r.due_date).slice(0, 10) : null;
     const overdue = !!due && due < todayYmd;
@@ -252,8 +258,8 @@ async function insightsOf(open) {
   if (insightPeople.length) {
     const [m] = await db.query(
       `SELECT m.person_id, m.job_id FROM person_mentions m JOIN processing_jobs j ON j.id = m.job_id JOIN audio_files f ON f.id = j.audio_file_id
-        WHERE m.person_id IN (?) ORDER BY f.created_at DESC, m.id DESC`,
-      [insightPeople],
+        WHERE j.user_id = ? AND m.person_id IN (?) ORDER BY f.created_at DESC, m.id DESC`,
+      [uid(), insightPeople],
     );
     for (const r of m) {
       const list = latestJobs.get(r.person_id) ?? [];
@@ -310,10 +316,11 @@ export async function insightsPage({ offset = 0, limit = INSIGHTS_FIRST, now = D
 
 export async function todayData({ since, live = [], now = Date.now() } = {}) {
   const db = getPool();
+  const user = uid();
   const sinceMs = Date.parse(since);
 
   // Calls and chats analysed in the period (processing_jobs.created_at is written by MySQL).
-  const [analysed] = await db.query("SELECT kind, COUNT(*) AS n FROM processing_jobs WHERE status = 'completed' AND UNIX_TIMESTAMP(created_at) >= ? GROUP BY kind", [Math.floor(sinceMs / 1000)]);
+  const [analysed] = await db.query("SELECT kind, COUNT(*) AS n FROM processing_jobs WHERE user_id = ? AND status = 'completed' AND UNIX_TIMESTAMP(created_at) >= ? GROUP BY kind", [user, Math.floor(sinceMs / 1000)]);
   const count = (k) => Number(analysed.find((r) => r.kind === k)?.n ?? 0);
 
   // Opportunities (the panel's data: person, chance, due date, overdue).
@@ -352,7 +359,9 @@ export async function todayData({ since, live = [], now = Date.now() } = {}) {
   // New referrals: people who came in during the period through someone the owner knows.
   const [refs] = await db.query(
     `SELECT p.id, p.name, p.first_seen_at, i.id AS intro_id, i.name AS intro_name
-       FROM people p JOIN people i ON i.id = p.introduced_by_id`,
+       FROM people p JOIN people i ON i.id = p.introduced_by_id AND i.user_id = p.user_id
+      WHERE p.user_id = ?`,
+    [user],
   );
   const referrals = refs.filter((r) => Date.parse(dateIso(r.first_seen_at)) >= sinceMs).map((r) => ({ id: r.id, name: r.name, via: { id: r.intro_id, name: r.intro_name } }));
   const via = new Map();
@@ -401,7 +410,14 @@ export async function todayData({ since, live = [], now = Date.now() } = {}) {
   // Stage movement in the period, net per deal: the stage it was in at the start of the period -> the
   // stage it is in now (a deal moved and moved back shows no change). A deal being created is "new".
   const moveRows = await orEmpty(
-    db.query("SELECT opportunity_id, from_stage, to_stage, changed_by, created_at FROM opportunity_stage_changes WHERE from_stage IS NOT NULL ORDER BY created_at, id").then(([r]) => r),
+    db
+      .query(
+        `SELECT c.opportunity_id, c.from_stage, c.to_stage, c.changed_by, c.created_at
+           FROM opportunity_stage_changes c JOIN opportunities o ON o.id = c.opportunity_id
+          WHERE o.user_id = ? AND c.from_stage IS NOT NULL AND c.created_at >= ? ORDER BY c.created_at, c.id`,
+        [user, new Date(sinceMs)],
+      )
+      .then(([r]) => r),
   );
   const perDeal = new Map();
   for (const r of moveRows) {
@@ -422,14 +438,14 @@ export async function todayData({ since, live = [], now = Date.now() } = {}) {
   const movedBack = net.filter((m) => m.direction === "same").length;
 
   // Inbox: people found in calls waiting to be added, and new departments suggested in calls.
-  const [peopleWaiting] = await db.query("SELECT id, name FROM person_suggestions WHERE status = 'pending' ORDER BY created_at DESC, id LIMIT 200");
-  const deptIdeas = await orEmpty(db.query("SELECT id, name FROM department_suggestions WHERE status = 'pending' ORDER BY created_at DESC LIMIT 50").then(([r]) => r));
+  const [peopleWaiting] = await db.query("SELECT id, name FROM person_suggestions WHERE user_id = ? AND status = 'pending' ORDER BY created_at DESC, id LIMIT 200", [user]);
+  const deptIdeas = await orEmpty(db.query("SELECT id, name FROM department_suggestions WHERE user_id = ? AND status = 'pending' ORDER BY created_at DESC LIMIT 50", [user]).then(([r]) => r));
 
   // Live: calls and chats being analysed now (and just finished), with their uploaded names.
   const stored = live.map((j) => j.filename).filter(Boolean);
   const names = new Map();
   if (stored.length) {
-    const [rows] = await db.query("SELECT stored_name, original_name FROM audio_files WHERE stored_name IN (?)", [stored]);
+    const [rows] = await db.query("SELECT stored_name, original_name FROM audio_files WHERE user_id = ? AND stored_name IN (?)", [user, stored]);
     for (const r of rows) names.set(r.stored_name, r.original_name);
   }
   const liveOut = live.map((j) => ({
@@ -445,7 +461,7 @@ export async function todayData({ since, live = [], now = Date.now() } = {}) {
   }));
 
   return {
-    owner: config.AUTH.ownerName ?? null,
+    owner: ownerName(),
     since: new Date(sinceMs).toISOString(),
     analysed: { calls: count("audio"), chats: count("whatsapp") },
     numbers: {

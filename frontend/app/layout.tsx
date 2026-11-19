@@ -15,8 +15,8 @@ const notoTamil = Noto_Sans_Tamil({
 });
 
 export const metadata: Metadata = {
-  title: "Call Analysis",
-  description: "Call recording transcript, summary, commitments, signals and outcome",
+  title: "Opportunity Room · Teemly",
+  description: "Your private room for every person and opportunity from your calls",
 };
 
 export default function RootLayout({ children }: LayoutProps<"/">) {

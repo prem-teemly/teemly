@@ -8,10 +8,15 @@
 //     people with the same name are never merged on the name alone;
 //   - someone who only took part (a speaker or chat sender) and is not in People is not suggested.
 // approveSuggestion() / ignoreSuggestion() are the owner's decision on a suggestion.
+//
+// Every person, suggestion and opportunity belongs to the signed-in user (user_id, migration 023):
+// each statement is limited to the current user's rows (uid()), so one account never reads, matches,
+// links or changes another account's people.
 
 import { getPool, withTransaction } from "./pool.js";
 import { CATEGORIES, initialsOf, interestScore, localYmd, nameKey, scoreValue } from "../services/people.js";
 import { dueFromWords } from "../dueWords.js";
+import { uid } from "../tenant.js";
 import { hexId } from "../util.js";
 import { WorkError, logStageChange } from "./personWork.js";
 import { AI_STAGES, normalizeStage, stageIndex } from "../stages.js";
@@ -43,15 +48,16 @@ export class InboxError extends Error {
  * department the owner took them out of is never added back).
  */
 async function applyFacts(conn, id, p, kind, at) {
-  const [[row]] = await conn.execute("SELECT departments, departments_removed FROM people WHERE id = ? FOR UPDATE", [id]);
+  const [[row]] = await conn.execute("SELECT departments, departments_removed FROM people WHERE id = ? AND user_id = ? FOR UPDATE", [id, uid()]);
+  if (!row) return;
   const removed = splitSet(row.departments_removed);
   p = { ...p, departments: splitSet(p.departments).filter((d) => !removed.includes(d)) };
   await conn.execute(
     `UPDATE people SET category = IF(category_locked, category, COALESCE(?, category)), role_title = COALESCE(?, role_title),
        organisation = COALESCE(?, organisation), city = COALESCE(?, city), departments = ?,
        last_contact_kind = IF(? >= last_contact_at, ?, last_contact_kind), last_contact_at = GREATEST(last_contact_at, ?)
-     WHERE id = ?`,
-    [p.category, p.role_title, p.organisation, p.city, deptSet(splitSet(row.departments), splitSet(p.departments)), at, kind, at, id],
+     WHERE id = ? AND user_id = ?`,
+    [p.category, p.role_title, p.organisation, p.city, deptSet(splitSet(row.departments), splitSet(p.departments)), at, kind, at, id, uid()],
   );
 }
 
@@ -103,9 +109,10 @@ const phoneEnd = (phone) => (phone ? String(phone).replace(/\D/g, "").slice(-4) 
 /** Who introduced whom: linked only when the introducer is exactly one known person (first introduction kept). */
 async function linkIntroducer(conn, personId, introducedBy) {
   if (!introducedBy) return;
-  const [rows] = await conn.execute("SELECT id FROM people WHERE name_key = ? LIMIT 2", [nameKey(introducedBy)]);
+  const user = uid();
+  const [rows] = await conn.execute("SELECT id FROM people WHERE user_id = ? AND name_key = ? LIMIT 2", [user, nameKey(introducedBy)]);
   if (rows.length === 1 && rows[0].id !== personId) {
-    await conn.execute("UPDATE people SET introduced_by_id = ? WHERE id = ? AND introduced_by_id IS NULL", [rows[0].id, personId]);
+    await conn.execute("UPDATE people SET introduced_by_id = ? WHERE id = ? AND user_id = ? AND introduced_by_id IS NULL", [rows[0].id, personId, user]);
   }
 }
 
@@ -119,7 +126,7 @@ async function refresh(conn, id) {
   const facts = (m) => [m.category, m.role_title, m.organisation, m.city].filter(Boolean).length;
   const best = rows.reduce((a, m) => (!a || facts(m) >= facts(a) ? m : a), null);
   const score = interestScore(rows.map((r) => r.interest)); // oldest to newest; null = not clear yet
-  await conn.execute("UPDATE people SET summary = COALESCE(?, summary), score = ? WHERE id = ?", [best?.context ?? null, score, id]);
+  await conn.execute("UPDATE people SET summary = COALESCE(?, summary), score = ? WHERE id = ? AND user_id = ?", [best?.context ?? null, score, id, uid()]);
 }
 
 const TITLE_STOP = new Set(["the", "a", "an", "for", "of", "to", "in", "on", "and", "with", "teemly", "deal", "opportunity"]);
@@ -161,17 +168,18 @@ export function sameDeal(existing, o) {
  */
 async function addOpportunities(conn, personId, jobId, opportunities) {
   if (!opportunities?.length) return 0;
-  const [[already]] = await conn.execute("SELECT 1 AS ok FROM opportunities WHERE person_id = ? AND source_job_id = ? AND origin = 'ai' LIMIT 1", [personId, jobId]);
+  const user = uid();
+  const [[already]] = await conn.execute("SELECT 1 AS ok FROM opportunities WHERE user_id = ? AND person_id = ? AND source_job_id = ? AND origin = 'ai' LIMIT 1", [user, personId, jobId]);
   if (already) return 0;
   // The person's open opportunities: a later call often talks about the same deal again ("the
   // campaign for two lakh, as we discussed"). That moves the existing one on instead of adding a copy.
-  const [open] = await conn.execute("SELECT id, title, stage, department, value_inr, next_step, due_date, origin FROM opportunities WHERE person_id = ? AND stage NOT IN ('Won','Lost') FOR UPDATE", [personId]);
+  const [open] = await conn.execute("SELECT id, title, stage, department, value_inr, next_step, due_date, origin FROM opportunities WHERE user_id = ? AND person_id = ? AND stage NOT IN ('Won','Lost') FOR UPDATE", [user, personId]);
   let added = 0;
   for (const raw of opportunities ?? []) {
     // Suggestions saved before migration 014 may still say "Proposal"; the AI never sets Won/Lost.
     const stage = AI_STAGES.includes(normalizeStage(raw.stage)) ? normalizeStage(raw.stage) : "Identified";
     const o = { ...raw, stage };
-    const [[dup]] = await conn.execute("SELECT 1 AS ok FROM opportunities WHERE person_id = ? AND source_job_id = ? AND title = ? LIMIT 1", [personId, jobId, o.title]);
+    const [[dup]] = await conn.execute("SELECT 1 AS ok FROM opportunities WHERE user_id = ? AND person_id = ? AND source_job_id = ? AND title = ? LIMIT 1", [user, personId, jobId, o.title]);
     if (dup) continue;
     const same = open.find((e) => sameDeal(e, o));
     if (same) {
@@ -182,7 +190,7 @@ async function addOpportunities(conn, personId, jobId, opportunities) {
         // A date said in a later call fills an empty due date (a date already set is never changed).
         const newDate = o.due_date && !same.due_date ? o.due_date : null;
         if (forward || (o.next_step && o.next_step !== same.next_step) || newDate) {
-          await conn.execute("UPDATE opportunities SET stage = ?, next_step = COALESCE(?, next_step), due_date = COALESCE(due_date, ?), updated_at = ? WHERE id = ?", [forward ? o.stage : same.stage, o.next_step ?? null, newDate, new Date(), same.id]);
+          await conn.execute("UPDATE opportunities SET stage = ?, next_step = COALESCE(?, next_step), due_date = COALESCE(due_date, ?), updated_at = ? WHERE id = ? AND user_id = ?", [forward ? o.stage : same.stage, o.next_step ?? null, newDate, new Date(), same.id, user]);
           if (newDate) same.due_date = newDate;
           if (forward) {
             await logStageChange(conn, same.id, same.stage, o.stage, "ai", jobId);
@@ -195,9 +203,9 @@ async function addOpportunities(conn, personId, jobId, opportunities) {
     const now = new Date();
     const newId = hexId();
     await conn.execute(
-      `INSERT INTO opportunities (id, person_id, title, stage, department, value_inr, next_step, due_date, source_job_id, origin, evidence, closed_at, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'ai', ?, NULL, ?, ?)`,
-      [newId, personId, o.title, o.stage, o.department ?? null, o.value_inr ?? null, o.next_step ?? null, o.due_date ?? null, jobId, JSON.stringify(o.evidence ?? []), now, now],
+      `INSERT INTO opportunities (id, user_id, person_id, title, stage, department, value_inr, next_step, due_date, source_job_id, origin, evidence, closed_at, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'ai', ?, NULL, ?, ?)`,
+      [newId, uid(), personId, o.title, o.stage, o.department ?? null, o.value_inr ?? null, o.next_step ?? null, o.due_date ?? null, jobId, JSON.stringify(o.evidence ?? []), now, now],
     );
     await logStageChange(conn, newId, null, o.stage, "ai", jobId);
     added += 1;
@@ -228,6 +236,7 @@ export async function recordPeople(jobId, kind, people, lines = [], target = nul
   // A file added on a person's page: that person's name (or first name) in it is them.
   const targetFirst = target ? target.key.split(" ")[0] : null;
   const isTarget = (p) => !!target && (p.key === target.key || p.key.split(" ")[0] === targetFirst);
+  const user = uid();
   return withTransaction(async (conn) => {
     const now = new Date();
     const linked = new Map(); // name key -> person id
@@ -241,9 +250,9 @@ export async function recordPeople(jobId, kind, people, lines = [], target = nul
         linked.set(p.key, target.id);
         continue;
       }
-      const [[decided]] = await conn.execute("SELECT id, status FROM person_suggestions WHERE job_id = ? AND name_key = ? FOR UPDATE", [jobId, p.key]);
+      const [[decided]] = await conn.execute("SELECT id, status FROM person_suggestions WHERE user_id = ? AND job_id = ? AND name_key = ? FOR UPDATE", [user, jobId, p.key]);
       if (decided?.status === "ignored") continue; // the owner said no for this conversation
-      const [matches] = await conn.execute("SELECT id, city, organisation, departments FROM people WHERE name_key = ? LIMIT 2 FOR UPDATE", [p.key]);
+      const [matches] = await conn.execute("SELECT id, city, organisation, departments FROM people WHERE user_id = ? AND name_key = ? LIMIT 2 FOR UPDATE", [user, p.key]);
 
       // Exactly one person with this name, and nothing in this conversation says otherwise: it is them.
       // A different city or company means it may be someone else: the owner is asked (inbox).
@@ -264,15 +273,15 @@ export async function recordPeople(jobId, kind, people, lines = [], target = nul
       if (decided) {
         await conn.execute(
           `UPDATE person_suggestions SET name = ?, relation = ?, category = ?, role_title = ?, organisation = ?, city = ?, departments = ?, department_suggestions = ?,
-             interest = ?, introduced_by_name = ?, context = ?, quote = ?, evidence = ?, opportunities = ? WHERE id = ?`,
-          [...values, decided.id],
+             interest = ?, introduced_by_name = ?, context = ?, quote = ?, evidence = ?, opportunities = ? WHERE id = ? AND user_id = ?`,
+          [...values, decided.id, user],
         );
       } else {
         await conn.execute(
           `INSERT INTO person_suggestions (name, relation, category, role_title, organisation, city, departments, department_suggestions, interest,
-             introduced_by_name, context, quote, evidence, opportunities, id, job_id, name_key, created_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-          [...values, hexId(), jobId, p.key, now],
+             introduced_by_name, context, quote, evidence, opportunities, id, user_id, job_id, name_key, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          [...values, hexId(), user, jobId, p.key, now],
         );
       }
       suggested += 1;
@@ -288,7 +297,7 @@ export async function recordPeople(jobId, kind, people, lines = [], target = nul
 /** Set or clear a person's phone number. A number saved for someone else is a 409. */
 export async function setPhone(id, phone) {
   try {
-    const [r] = await getPool().execute("UPDATE people SET phone = ? WHERE id = ?", [phone, id]);
+    const [r] = await getPool().execute("UPDATE people SET phone = ? WHERE id = ? AND user_id = ?", [phone, id, uid()]);
     return r.affectedRows > 0;
   } catch (exc) {
     if (exc?.code === "ER_DUP_ENTRY") throw new WorkError(409, "This phone number is already saved for another person.");
@@ -302,27 +311,28 @@ export async function setPhone(id, phone) {
  * forgotten from that list. Returns the new list, or null when the person does not exist.
  */
 export async function setDepartments(id, departments) {
+  const user = uid();
   return withTransaction(async (conn) => {
-    const [[row]] = await conn.execute("SELECT departments, departments_removed FROM people WHERE id = ? FOR UPDATE", [id]);
+    const [[row]] = await conn.execute("SELECT departments, departments_removed FROM people WHERE id = ? AND user_id = ? FOR UPDATE", [id, user]);
     if (!row) return null;
     const next = splitSet(deptSet(departments));
     const takenAway = splitSet(row.departments).filter((d) => !next.includes(d));
     const removed = [...splitSet(row.departments_removed), ...takenAway].filter((d) => !next.includes(d));
-    await conn.execute("UPDATE people SET departments = ?, departments_removed = ? WHERE id = ?", [deptSet(next), deptSet(removed), id]);
+    await conn.execute("UPDATE people SET departments = ?, departments_removed = ? WHERE id = ? AND user_id = ?", [deptSet(next), deptSet(removed), id, user]);
     return next;
   });
 }
 
 /** People already in People with this name (to ask before adding someone with the same name). */
 export async function sameNamePeople(name) {
-  const [rows] = await getPool().query("SELECT id, name, city, organisation, departments, phone FROM people WHERE name_key = ? ORDER BY last_contact_at DESC LIMIT 5", [nameKey(name)]);
+  const [rows] = await getPool().query("SELECT id, name, city, organisation, departments, phone FROM people WHERE user_id = ? AND name_key = ? ORDER BY last_contact_at DESC LIMIT 5", [uid(), nameKey(name)]);
   return rows.map((r) => ({ id: r.id, name: r.name, city: r.city, organisation: r.organisation, departments: splitSet(r.departments), phone_end: phoneEnd(r.phone) }));
 }
 
 /** The person a phone number (E.164, e.g. +919876543210) is saved for, or null. */
 export async function personByPhone(phone) {
   if (!phone) return null;
-  const [[r]] = await getPool().query("SELECT id, name, city, organisation, departments, phone FROM people WHERE phone = ? LIMIT 1", [phone]);
+  const [[r]] = await getPool().query("SELECT id, name, city, organisation, departments, phone FROM people WHERE user_id = ? AND phone = ? LIMIT 1", [uid(), phone]);
   return r ? { id: r.id, name: r.name, city: r.city, organisation: r.organisation, departments: splitSet(r.departments), phone_end: phoneEnd(r.phone) } : null;
 }
 
@@ -331,20 +341,21 @@ export async function personByPhone(phone) {
  * (parseNewPerson); `introducedById`: someone already in People. Returns the new person's id.
  */
 export async function createPerson(form, { introducedById = null } = {}) {
+  const user = uid();
   return withTransaction(async (conn) => {
     if (introducedById) {
-      const [[intro]] = await conn.execute("SELECT id FROM people WHERE id = ?", [introducedById]);
+      const [[intro]] = await conn.execute("SELECT id FROM people WHERE id = ? AND user_id = ?", [introducedById, user]);
       if (!intro) throw new WorkError(422, "introduced_by_id: that person is no longer in People");
     }
     const id = hexId();
     const now = new Date();
     try {
       await conn.execute(
-        `INSERT INTO people (id, name, name_key, category, category_locked, role_title, organisation, city, phone, departments, consent,
+        `INSERT INTO people (id, user_id, name, name_key, category, category_locked, role_title, organisation, city, phone, departments, consent,
            introduced_by_id, summary, first_seen_at, last_contact_at, last_contact_kind)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'added')`,
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'added')`,
         [
-          id, form.name, nameKey(form.name), form.category ?? null, form.category ? 1 : 0, form.role_title ?? null, form.organisation ?? null,
+          id, user, form.name, nameKey(form.name), form.category ?? null, form.category ? 1 : 0, form.role_title ?? null, form.organisation ?? null,
           form.city ?? null, form.phone ?? null, deptSet(form.departments ?? []), form.consent ?? "Ask", introducedById, form.context ?? null, now, now,
         ],
       );
@@ -358,13 +369,17 @@ export async function createPerson(form, { introducedById = null } = {}) {
 
 /** { id, name, key } of a person, or null. */
 export async function personRef(id) {
-  const [[row]] = await getPool().execute("SELECT id, name, name_key FROM people WHERE id = ?", [id]);
+  const [[row]] = await getPool().execute("SELECT id, name, name_key FROM people WHERE id = ? AND user_id = ?", [id, uid()]);
   return row ? { id: row.id, name: row.name, key: row.name_key } : null;
 }
 
 /** Remember that a job was uploaded on a person's page (processing_jobs.person_id, migration 007). */
 export async function setJobPerson(jobId, personId) {
-  await getPool().execute("UPDATE processing_jobs SET person_id = ? WHERE id = ?", [personId, jobId]);
+  const user = uid();
+  await getPool().execute(
+    "UPDATE processing_jobs j JOIN people p ON p.id = ? AND p.user_id = j.user_id SET j.person_id = p.id WHERE j.id = ? AND j.user_id = ?",
+    [personId, jobId, user],
+  );
 }
 
 /**
@@ -373,9 +388,12 @@ export async function setJobPerson(jobId, personId) {
  * already on their timeline. Returns true when a mention was added.
  */
 export async function linkJobToPerson(jobId, kind, personId, context) {
+  const user = uid();
   return withTransaction(async (conn) => {
-    const [[person]] = await conn.execute("SELECT id FROM people WHERE id = ? FOR UPDATE", [personId]);
+    const [[person]] = await conn.execute("SELECT id FROM people WHERE id = ? AND user_id = ? FOR UPDATE", [personId, user]);
     if (!person) return false;
+    const [[job]] = await conn.execute("SELECT 1 AS ok FROM processing_jobs WHERE id = ? AND user_id = ?", [jobId, user]);
+    if (!job) return false;
     const [[has]] = await conn.execute("SELECT 1 AS ok FROM person_mentions WHERE person_id = ? AND job_id = ?", [personId, jobId]);
     if (has) return false;
     const now = new Date();
@@ -396,7 +414,8 @@ export async function linkJobToPerson(jobId, kind, personId, context) {
  * (only when every remaining conversation recorded its departments, migration 011).
  */
 async function forgetFacts(conn, id, moved) {
-  const [[person]] = await conn.execute("SELECT category, category_locked, role_title, organisation, city, departments, summary FROM people WHERE id = ? FOR UPDATE", [id]);
+  const user = uid();
+  const [[person]] = await conn.execute("SELECT category, category_locked, role_title, organisation, city, departments, summary FROM people WHERE id = ? AND user_id = ? FOR UPDATE", [id, user]);
   if (!person) return;
   const [rest] = await conn.execute("SELECT category, role_title, organisation, city, departments, context FROM person_mentions WHERE person_id = ? ORDER BY created_at, id", [id]);
   const latest = (f) => [...rest].reverse().find((r) => r[f])?.[f] ?? null;
@@ -417,13 +436,13 @@ async function forgetFacts(conn, id, moved) {
   }
   const movedDepts = splitSet(moved.departments);
   if (movedDepts.length && rest.every((r) => r.departments !== null)) {
-    const [opps] = await conn.execute("SELECT DISTINCT department FROM opportunities WHERE person_id = ? AND department IS NOT NULL", [id]);
+    const [opps] = await conn.execute("SELECT DISTINCT department FROM opportunities WHERE user_id = ? AND person_id = ? AND department IS NOT NULL", [user, id]);
     const keep = new Set([...rest.flatMap((r) => splitSet(r.departments)), ...opps.map((o) => o.department)]);
     const next = splitSet(person.departments).filter((d) => !movedDepts.includes(d) || keep.has(d));
     sets.push("departments = ?");
     params.push(deptSet(next));
   }
-  if (sets.length) await conn.execute(`UPDATE people SET ${sets.join(", ")} WHERE id = ?`, [...params, id]);
+  if (sets.length) await conn.execute(`UPDATE people SET ${sets.join(", ")} WHERE id = ? AND user_id = ?`, [...params, id, user]);
 }
 
 /**
@@ -434,29 +453,30 @@ async function forgetFacts(conn, id, moved) {
  * Returns { person_id } or { suggestion_id }.
  */
 export async function moveMention(fromId, jobId, { toPersonId = null, toInbox = false, lines = [] } = {}) {
+  const user = uid();
   return withTransaction(async (conn) => {
     const [[m]] = await conn.execute(
       `SELECT m.*, j.kind, p.name, p.name_key FROM person_mentions m
          JOIN people p ON p.id = m.person_id JOIN processing_jobs j ON j.id = m.job_id
-        WHERE m.person_id = ? AND m.job_id = ? FOR UPDATE`,
-      [fromId, jobId],
+        WHERE m.person_id = ? AND m.job_id = ? AND p.user_id = ? AND j.user_id = ? FOR UPDATE`,
+      [fromId, jobId, user, user],
     );
     if (!m) throw new WorkError(404, "This conversation is not on this person's timeline.");
-    const [opps] = await conn.execute("SELECT * FROM opportunities WHERE person_id = ? AND source_job_id = ? AND origin = 'ai' FOR UPDATE", [fromId, jobId]);
+    const [opps] = await conn.execute("SELECT * FROM opportunities WHERE user_id = ? AND person_id = ? AND source_job_id = ? AND origin = 'ai' FOR UPDATE", [user, fromId, jobId]);
     const at = m.created_at instanceof Date ? m.created_at : new Date(m.created_at);
     let result;
 
     if (toPersonId) {
       if (toPersonId === fromId) throw new WorkError(422, "person_id: choose a different person");
-      const [[to]] = await conn.execute("SELECT id FROM people WHERE id = ? FOR UPDATE", [toPersonId]);
+      const [[to]] = await conn.execute("SELECT id FROM people WHERE id = ? AND user_id = ? FOR UPDATE", [toPersonId, user]);
       if (!to) throw new WorkError(404, "That person is not in People.");
       const [[has]] = await conn.execute("SELECT id FROM person_mentions WHERE person_id = ? AND job_id = ?", [toPersonId, jobId]);
       if (has) await conn.execute("DELETE FROM person_mentions WHERE id = ?", [m.id]);
       else await conn.execute("UPDATE person_mentions SET person_id = ? WHERE id = ?", [toPersonId, m.id]);
-      const [[toHasOpps]] = await conn.execute("SELECT 1 AS ok FROM opportunities WHERE person_id = ? AND source_job_id = ? AND origin = 'ai' LIMIT 1", [toPersonId, jobId]);
+      const [[toHasOpps]] = await conn.execute("SELECT 1 AS ok FROM opportunities WHERE user_id = ? AND person_id = ? AND source_job_id = ? AND origin = 'ai' LIMIT 1", [user, toPersonId, jobId]);
       if (opps.length) {
-        if (toHasOpps) await conn.query("DELETE FROM opportunities WHERE id IN (?)", [opps.map((o) => o.id)]);
-        else await conn.query("UPDATE opportunities SET person_id = ?, updated_at = ? WHERE id IN (?)", [toPersonId, new Date(), opps.map((o) => o.id)]);
+        if (toHasOpps) await conn.query("DELETE FROM opportunities WHERE user_id = ? AND id IN (?)", [user, opps.map((o) => o.id)]);
+        else await conn.query("UPDATE opportunities SET person_id = ?, updated_at = ? WHERE user_id = ? AND id IN (?)", [toPersonId, new Date(), user, opps.map((o) => o.id)]);
       }
       await applyFacts(conn, toPersonId, { ...m, departments: splitSet(m.departments) }, m.kind, at);
       await linkIntroducer(conn, toPersonId, m.introduced_by_name);
@@ -467,25 +487,25 @@ export async function moveMention(fromId, jobId, { toPersonId = null, toInbox = 
       const evidence = evidenceOf({ evidence: parseJson(m.evidence_lines) ?? [], key: m.name_key }, lines);
       const oppsJson = opps.map((o) => ({ title: o.title, stage: o.stage, department: o.department, value_inr: o.value_inr === null ? null : Number(o.value_inr), next_step: o.next_step, evidence: parseJson(o.evidence) ?? [] }));
       const values = [m.name, m.relation, m.category, m.role_title, m.organisation, m.city, m.departments ?? "", m.interest, m.introduced_by_name, m.context, m.quote, JSON.stringify(evidence), JSON.stringify(oppsJson)];
-      const [[old]] = await conn.execute("SELECT id FROM person_suggestions WHERE job_id = ? AND name_key = ? FOR UPDATE", [jobId, m.name_key]);
+      const [[old]] = await conn.execute("SELECT id FROM person_suggestions WHERE user_id = ? AND job_id = ? AND name_key = ? FOR UPDATE", [user, jobId, m.name_key]);
       let sid = old?.id;
       if (old) {
         await conn.execute(
           `UPDATE person_suggestions SET name = ?, relation = ?, category = ?, role_title = ?, organisation = ?, city = ?, departments = ?,
              interest = ?, introduced_by_name = ?, context = ?, quote = ?, evidence = ?, opportunities = ?,
-             status = 'pending', person_id = NULL, decided_at = NULL WHERE id = ?`,
-          [...values, sid],
+             status = 'pending', person_id = NULL, decided_at = NULL WHERE id = ? AND user_id = ?`,
+          [...values, sid, user],
         );
       } else {
         sid = hexId();
         await conn.execute(
           `INSERT INTO person_suggestions (name, relation, category, role_title, organisation, city, departments, interest,
-             introduced_by_name, context, quote, evidence, opportunities, id, job_id, name_key, created_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-          [...values, sid, jobId, m.name_key, new Date()],
+             introduced_by_name, context, quote, evidence, opportunities, id, user_id, job_id, name_key, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          [...values, sid, user, jobId, m.name_key, new Date()],
         );
       }
-      if (opps.length) await conn.query("DELETE FROM opportunities WHERE id IN (?)", [opps.map((o) => o.id)]);
+      if (opps.length) await conn.query("DELETE FROM opportunities WHERE user_id = ? AND id IN (?)", [user, opps.map((o) => o.id)]);
       await conn.execute("DELETE FROM person_mentions WHERE id = ?", [m.id]);
       result = { suggestion_id: sid };
     } else {
@@ -517,7 +537,8 @@ function suggestionsOf(r) {
 /** Inbox items, newest first, each with the people that share its name and its introducer. */
 export async function listSuggestions({ status = "pending", limit = 200 } = {}) {
   const db = getPool();
-  const [rows] = await db.query(`${SUGGESTION_SELECT} WHERE s.status = ? ORDER BY s.created_at DESC, s.id LIMIT ?`, [status, limit]);
+  const user = uid();
+  const [rows] = await db.query(`${SUGGESTION_SELECT} WHERE s.user_id = ? AND s.status = ? ORDER BY s.created_at DESC, s.id LIMIT ?`, [user, status, limit]);
   const keys = [...new Set(rows.flatMap((r) => [r.name_key, r.introduced_by_name ? nameKey(r.introduced_by_name) : null]).filter(Boolean))];
   const firsts = [...new Set(rows.map((r) => r.name_key.split(" ")[0]))];
   const byKey = new Map();
@@ -527,8 +548,8 @@ export async function listSuggestions({ status = "pending", limit = 200 } = {}) 
     const [people] = await db.query(
       `SELECT p.id, p.name, p.name_key, p.category, p.role_title, p.organisation, p.city, p.departments, p.phone,
               (SELECT COUNT(*) FROM person_mentions m WHERE m.person_id = p.id) AS mention_count
-       FROM people p WHERE p.name_key IN (?) OR SUBSTRING_INDEX(p.name_key, ' ', 1) IN (?) ORDER BY p.last_contact_at DESC`,
-      [keys, firsts],
+       FROM people p WHERE p.user_id = ? AND (p.name_key IN (?) OR SUBSTRING_INDEX(p.name_key, ' ', 1) IN (?)) ORDER BY p.last_contact_at DESC`,
+      [user, keys, firsts],
     );
     for (const p of people) {
       const card = { id: p.id, name: p.name, initials: initialsOf(p.name), category: p.category, role_title: p.role_title, organisation: p.organisation, city: p.city, departments: splitSet(p.departments), phone_end: phoneEnd(p.phone), mention_count: Number(p.mention_count) };
@@ -580,12 +601,12 @@ export async function listSuggestions({ status = "pending", limit = 200 } = {}) 
 }
 
 export async function pendingCount() {
-  const [[row]] = await getPool().query("SELECT COUNT(*) AS n FROM person_suggestions WHERE status = 'pending'");
+  const [[row]] = await getPool().query("SELECT COUNT(*) AS n FROM person_suggestions WHERE user_id = ? AND status = 'pending'", [uid()]);
   return Number(row.n);
 }
 
 async function lockPending(conn, id) {
-  const [[s]] = await conn.execute(`${SUGGESTION_SELECT} WHERE s.id = ? FOR UPDATE`, [id]);
+  const [[s]] = await conn.execute(`${SUGGESTION_SELECT} WHERE s.id = ? AND s.user_id = ? FOR UPDATE`, [id, uid()]);
   if (!s) throw new InboxError(404, "This inbox item was not found.");
   if (s.status !== "pending") throw new InboxError(409, `This item was already ${s.status === "added" ? "added" : "ignored"}.`);
   return s;
@@ -616,9 +637,10 @@ export async function approveSuggestion(id, { personId = null, form = {} } = {})
       evidence: evidence.map((e) => e.id),
     };
 
+    const user = uid();
     let target = personId;
     if (target) {
-      const [[row]] = await conn.execute("SELECT id FROM people WHERE id = ? FOR UPDATE", [target]);
+      const [[row]] = await conn.execute("SELECT id FROM people WHERE id = ? AND user_id = ? FOR UPDATE", [target, user]);
       if (!row) throw new InboxError(404, "That person is no longer in People.");
       await applyFacts(conn, target, mention, s.kind, at);
     } else {
@@ -627,11 +649,11 @@ export async function approveSuggestion(id, { personId = null, form = {} } = {})
       const category = form.category === undefined ? s.category : form.category;
       try {
         await conn.execute(
-          `INSERT INTO people (id, name, name_key, category, category_locked, role_title, organisation, city, phone, departments, consent,
+          `INSERT INTO people (id, user_id, name, name_key, category, category_locked, role_title, organisation, city, phone, departments, consent,
              summary, first_seen_at, last_contact_at, last_contact_kind)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
           [
-            target, name, nameKey(name), category, category !== s.category ? 1 : 0,
+            target, user, name, nameKey(name), category, category !== s.category ? 1 : 0,
             form.role_title === undefined ? s.role_title : form.role_title,
             form.organisation === undefined ? s.organisation : form.organisation,
             form.city === undefined ? s.city : form.city,
@@ -650,7 +672,7 @@ export async function approveSuggestion(id, { personId = null, form = {} } = {})
     await addOpportunities(conn, target, s.job_id, parseJson(s.opportunities) ?? []);
     await linkIntroducer(conn, target, s.introduced_by_name);
     await refresh(conn, target);
-    await conn.execute("UPDATE person_suggestions SET status = 'added', person_id = ?, decided_at = UTC_TIMESTAMP(3) WHERE id = ?", [target, id]);
+    await conn.execute("UPDATE person_suggestions SET status = 'added', person_id = ?, decided_at = UTC_TIMESTAMP(3) WHERE id = ? AND user_id = ?", [target, id, user]);
     return target;
   });
 }
@@ -659,7 +681,7 @@ export async function approveSuggestion(id, { personId = null, form = {} } = {})
 export async function ignoreSuggestion(id) {
   return withTransaction(async (conn) => {
     await lockPending(conn, id);
-    await conn.execute("UPDATE person_suggestions SET status = 'ignored', decided_at = UTC_TIMESTAMP(3) WHERE id = ?", [id]);
+    await conn.execute("UPDATE person_suggestions SET status = 'ignored', decided_at = UTC_TIMESTAMP(3) WHERE id = ? AND user_id = ?", [id, uid()]);
   });
 }
 
@@ -688,13 +710,14 @@ function publicPerson(r) {
   };
 }
 
+// Callers add `WHERE p.user_id = ? …`.
 const PERSON_SELECT = `
   SELECT p.*, i.id AS intro_id, i.name AS intro_name,
          (SELECT COUNT(*) FROM person_mentions m WHERE m.person_id = p.id) AS mention_count
-  FROM people p LEFT JOIN people i ON i.id = p.introduced_by_id`;
+  FROM people p LEFT JOIN people i ON i.id = p.introduced_by_id AND i.user_id = p.user_id`;
 
 export async function listPeople() {
-  const [rows] = await getPool().query(`${PERSON_SELECT} ORDER BY p.last_contact_at DESC, p.name LIMIT 1000`);
+  const [rows] = await getPool().query(`${PERSON_SELECT} WHERE p.user_id = ? ORDER BY p.last_contact_at DESC, p.name LIMIT 1000`, [uid()]);
   return rows.map(publicPerson);
 }
 
@@ -725,7 +748,7 @@ const taskKey = (who, task) => `${nameKey(who ?? "")}|${String(task ?? "").toLow
 export async function personCommitments(id, { ownerName = null, name = null, view = "open", offset = 0, limit = COMMITMENTS_FIRST, now = Date.now() } = {}) {
   const db = getPool();
   if (name === null) {
-    const [[p]] = await db.execute("SELECT name FROM people WHERE id = ?", [id]);
+    const [[p]] = await db.execute("SELECT name FROM people WHERE id = ? AND user_id = ?", [id, uid()]);
     if (!p) return null;
     name = p.name;
   }
@@ -737,9 +760,10 @@ export async function personCommitments(id, { ownerName = null, name = null, vie
      JOIN person_mentions m ON m.job_id = s.job_id AND m.person_id = ?
      JOIN processing_jobs j ON j.id = s.job_id
      JOIN audio_files f ON f.id = j.audio_file_id
+     WHERE j.user_id = ?
      ORDER BY f.created_at DESC, a.seq
      LIMIT 1000`,
-    [id],
+    [id, uid()],
   );
   const first = nameKey(name).split(" ")[0];
   const names = (t) => nameKey(t ?? "").split(/[^a-z0-9]+/);
@@ -804,7 +828,8 @@ export async function personCommitments(id, { ownerName = null, name = null, vie
  */
 export async function getPerson(id, { ownerName = null } = {}) {
   const db = getPool();
-  const [[row]] = await db.execute(`${PERSON_SELECT} WHERE p.id = ?`, [id]);
+  const user = uid();
+  const [[row]] = await db.execute(`${PERSON_SELECT} WHERE p.id = ? AND p.user_id = ?`, [id, user]);
   if (!row) return null;
   const [mentions] = await db.execute(
     `SELECT m.job_id, m.relation, m.category, m.role_title, m.organisation, m.city, m.interest, m.introduced_by_name,
@@ -821,11 +846,11 @@ export async function getPerson(id, { ownerName = null } = {}) {
      FROM person_mentions m
      JOIN processing_jobs j ON j.id = m.job_id
      JOIN audio_files f ON f.id = j.audio_file_id
-     WHERE m.person_id = ?
+     WHERE m.person_id = ? AND j.user_id = ?
      ORDER BY f.created_at DESC, m.id DESC`,
-    [id],
+    [id, user],
   );
-  const [introduced] = await db.execute("SELECT id, name, category, departments FROM people WHERE introduced_by_id = ? ORDER BY first_seen_at DESC, name", [id]);
+  const [introduced] = await db.execute("SELECT id, name, category, departments FROM people WHERE user_id = ? AND introduced_by_id = ? ORDER BY first_seen_at DESC, name", [user, id]);
 
   // Commitments: the first page of the open ones (more with personCommitments()).
   const commitmentsPage = await personCommitments(id, { ownerName, name: row.name });
@@ -866,28 +891,35 @@ export async function getPerson(id, { ownerName = null } = {}) {
 
 /** Tick or untick a commitment. Returns false when it does not exist. */
 export async function setCommitmentDone(actionId, done) {
-  const [r] = await getPool().execute("UPDATE action_items SET status = ? WHERE id = ?", [done ? "done" : "open", actionId]);
+  // A commitment is the current user's when its conversation is (action_items -> summaries -> job).
+  const [r] = await getPool().execute(
+    `UPDATE action_items a JOIN summaries s ON s.id = a.summary_id JOIN processing_jobs j ON j.id = s.job_id
+        SET a.status = ? WHERE a.id = ? AND j.user_id = ?`,
+    [done ? "done" : "open", actionId, uid()],
+  );
   return r.affectedRows > 0;
 }
 
 /** The stored file of a job (for playing it back): { stored_name, kind, original_name, file_format } or null. */
 export async function jobFile(jobId) {
   const [[row]] = await getPool().execute(
-    "SELECT f.stored_name, f.kind, f.original_name, f.file_format FROM processing_jobs j JOIN audio_files f ON f.id = j.audio_file_id WHERE j.id = ? AND f.deleted_at IS NULL",
-    [jobId],
+    "SELECT f.stored_name, f.kind, f.original_name, f.file_format FROM processing_jobs j JOIN audio_files f ON f.id = j.audio_file_id WHERE j.id = ? AND j.user_id = ? AND f.user_id = j.user_id AND f.deleted_at IS NULL",
+    [jobId, uid()],
   );
   return row ?? null;
 }
 
 /** Counts for the owner's profile: people, conversations on timelines, open opportunities, inbox. */
 export async function roomStats() {
+  const user = uid();
   const [[r]] = await getPool().query(
     `SELECT
-       (SELECT COUNT(*) FROM people) AS people,
-       (SELECT COUNT(DISTINCT job_id) FROM person_mentions) AS conversations,
-       (SELECT COUNT(*) FROM opportunities WHERE stage NOT IN ('Won','Lost')) AS open_opportunities,
-       (SELECT COALESCE(SUM(value_inr), 0) FROM opportunities WHERE stage NOT IN ('Won','Lost')) AS open_value_inr,
-       (SELECT COUNT(*) FROM person_suggestions WHERE status = 'pending') AS inbox_pending`,
+       (SELECT COUNT(*) FROM people WHERE user_id = ?) AS people,
+       (SELECT COUNT(DISTINCT m.job_id) FROM person_mentions m JOIN people p ON p.id = m.person_id WHERE p.user_id = ?) AS conversations,
+       (SELECT COUNT(*) FROM opportunities WHERE user_id = ? AND stage NOT IN ('Won','Lost')) AS open_opportunities,
+       (SELECT COALESCE(SUM(value_inr), 0) FROM opportunities WHERE user_id = ? AND stage NOT IN ('Won','Lost')) AS open_value_inr,
+       (SELECT COUNT(*) FROM person_suggestions WHERE user_id = ? AND status = 'pending') AS inbox_pending`,
+    [user, user, user, user, user],
   );
   return {
     people: Number(r.people),
@@ -900,6 +932,6 @@ export async function roomStats() {
 
 /** Delete a person and everything stored about them (mentions cascade). */
 export async function deletePerson(id) {
-  const [r] = await getPool().execute("DELETE FROM people WHERE id = ?", [id]);
+  const [r] = await getPool().execute("DELETE FROM people WHERE id = ? AND user_id = ?", [id, uid()]);
   return r.affectedRows > 0;
 }

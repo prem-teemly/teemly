@@ -9,6 +9,7 @@ import { OPP_SELECT, WorkError, publicOpportunity } from "./personWork.js";
 import { listDepartments } from "./departments.js";
 import * as repo from "./repository.js";
 import { STAGES, STAGE_CHANCE } from "../stages.js";
+import { ownerName, uid } from "../tenant.js";
 import { jobLines } from "../services/peopleJob.js";
 import { analyzeOpportunity } from "../services/opportunityInsight.js";
 
@@ -26,8 +27,8 @@ async function conversationsOf(personId, limit = 10) {
   const [rows] = await getPool().query(
     `SELECT m.job_id, m.relation, m.context, m.quote, j.kind, f.original_name, f.duration_seconds, UNIX_TIMESTAMP(f.created_at) AS epoch
        FROM person_mentions m JOIN processing_jobs j ON j.id = m.job_id JOIN audio_files f ON f.id = j.audio_file_id
-      WHERE m.person_id = ? ORDER BY f.created_at DESC, m.id DESC LIMIT ?`,
-    [personId, limit],
+      WHERE m.person_id = ? AND j.user_id = ? ORDER BY f.created_at DESC, m.id DESC LIMIT ?`,
+    [personId, uid(), limit],
   );
   return rows.map((r) => ({ job_id: r.job_id, kind: r.kind, file_name: r.original_name, duration_seconds: r.duration_seconds === null ? null : Number(r.duration_seconds), at: isoOf(r.epoch), relation: r.relation, context: r.context, quote: r.quote }));
 }
@@ -42,12 +43,12 @@ async function introductionPath(person) {
   let next = person.introduced_by_id;
   while (next && !seen.has(next) && chain.length < 4) {
     seen.add(next);
-    const [[p]] = await getPool().execute("SELECT id, name, introduced_by_id FROM people WHERE id = ?", [next]);
+    const [[p]] = await getPool().execute("SELECT id, name, introduced_by_id FROM people WHERE id = ? AND user_id = ?", [next, uid()]);
     if (!p) break;
     chain.unshift({ id: p.id, name: p.name, initials: initialsOf(p.name) });
     next = p.introduced_by_id;
   }
-  const owner = config.AUTH.ownerName ?? "You";
+  const owner = ownerName();
   return [{ id: null, name: owner, initials: initialsOf(owner), owner: true }, ...chain, { id: person.id, name: person.name, initials: initialsOf(person.name) }];
 }
 
@@ -64,14 +65,16 @@ async function loadInsight(id) {
 /** Everything for one opportunity's page, or null when it does not exist. */
 export async function opportunityDetail(id) {
   const db = getPool();
-  const [[row]] = await db.execute(`${OPP_SELECT} WHERE o.id = ?`, [id]);
+  const user = uid();
+  const [[row]] = await db.execute(`${OPP_SELECT} WHERE o.user_id = ? AND o.id = ?`, [user, id]);
   if (!row) return null;
   const opportunity = publicOpportunity(row);
   const [[p]] = await db.execute(
     `SELECT p.id, p.name, p.category, p.role_title, p.organisation, p.city, p.score, p.first_seen_at, p.last_contact_at, p.introduced_by_id, i.name AS intro_name
-       FROM people p LEFT JOIN people i ON i.id = p.introduced_by_id WHERE p.id = ?`,
-    [row.person_id],
+       FROM people p LEFT JOIN people i ON i.id = p.introduced_by_id AND i.user_id = p.user_id WHERE p.id = ? AND p.user_id = ?`,
+    [row.person_id, user],
   );
+  if (!p) return null;
   const person = {
     id: p.id,
     name: p.name,

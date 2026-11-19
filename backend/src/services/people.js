@@ -17,6 +17,7 @@ import { norm } from "./pulse.js";
 import { listDepartments } from "../db/departments.js";
 import { AI_STAGES } from "../stages.js";
 import { getPool } from "../db/pool.js";
+import { ownerName as currentOwnerName, uid } from "../tenant.js";
 import { getLogger } from "../util.js";
 
 const logger = getLogger("app.services.people");
@@ -234,7 +235,7 @@ const has = (haystack, needle) => !!needle && ` ${haystack} `.includes(` ${needl
  * Keep only what the transcript supports. lines: numbered lines (pulse.linesFromSegments /
  * linesFromMessages) with speaker names already applied. Returns clean people, one per name.
  */
-export function validatePeople(raw, lines, ownerName = config.AUTH.ownerName, deptNames = DEPARTMENTS, callDate = localYmd()) {
+export function validatePeople(raw, lines, ownerName = currentOwnerName(), deptNames = DEPARTMENTS, callDate = localYmd()) {
   const byId = new Map(lines.map((l) => [l.id, l]));
   const position = new Map(lines.map((l, i) => [l.id, i]));
   const allText = lines.map((l) => `${norm(l.original ?? "")} ${norm(l.english ?? "")}`).join(" ");
@@ -457,7 +458,7 @@ async function knownPeople(lines) {
         .map((w) => w.toLowerCase())
         .filter((w) => w.length > 1),
     );
-    const [rows] = await db.query("SELECT name, name_key FROM people ORDER BY last_contact_at DESC LIMIT 2000");
+    const [rows] = await db.query("SELECT name, name_key FROM people WHERE user_id = ? ORDER BY last_contact_at DESC LIMIT 2000", [uid()]);
     return rows.filter((r) => said.has(String(r.name_key).split(" ")[0])).slice(0, 50).map((r) => r.name);
   } catch {
     return [];
@@ -465,7 +466,7 @@ async function knownPeople(lines) {
 }
 
 /** Ask the model for the people in numbered lines and return the validated list. */
-export async function extract(lines, ownerName = config.AUTH.ownerName) {
+export async function extract(lines, ownerName = currentOwnerName()) {
   return (await extractAll(lines, ownerName)).people;
 }
 
@@ -513,7 +514,7 @@ export const localYmd = (ms = Date.now()) => {
  * People (validated) and new-department ideas from one conversation, in one model call.
  * `callAt`: when the conversation was uploaded (ms), so "by Friday" or "the 25th" become real dates.
  */
-export async function extractAll(lines, ownerName = config.AUTH.ownerName, { callAt = Date.now() } = {}) {
+export async function extractAll(lines, ownerName = currentOwnerName(), { callAt = Date.now() } = {}) {
   if (!lines.length) return { people: [], departmentIdeas: [] };
   const [departments, known] = await Promise.all([currentDepartments(), knownPeople(lines)]);
   const names = departments.map((d) => d.name);

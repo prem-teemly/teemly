@@ -550,7 +550,8 @@ test("security: retention is off by default and never deletes a file a job is us
   assert.equal(existsSync(old), true);
 
   // Opt-in retention keeps files that a queued/processing job still reads.
-  const job = pipeline.submit(name, path.join(config.UPLOAD_DIR, "missing-" + name), null);
+  const { runAs } = await import("../src/tenant.js");
+  const job = runAs(config.testUser(), () => pipeline.submit(name, path.join(config.UPLOAD_DIR, "missing-" + name), null));
   const inUse = pipeline.filesInUse(); // the job is queued right after submit
   assert.equal(inUse.has(name), true);
   assert.equal(await purgeOldUploads(24, inUse, dir), 0);

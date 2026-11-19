@@ -9,6 +9,7 @@
 import { getPool } from "./pool.js";
 import { chanceOf } from "./personWork.js";
 import { CLOSED_STAGES, OPEN_STAGES, STAGES, STAGE_CHANCE, stageIndex } from "../stages.js";
+import { uid } from "../tenant.js";
 
 const DAY = 86_400_000;
 const QUIET_DAYS = 14; // no call or chat with the person
@@ -27,6 +28,7 @@ const fmtInr = (v) => (v >= 1e7 ? `₹${+(v / 1e7).toFixed(2)} Cr` : v >= 1e5 ? 
 /** The board: stages (with chance), every opportunity, and nudges. */
 export async function opportunityBoard({ now = Date.now() } = {}) {
   const db = getPool();
+  const user = uid();
   // people and opportunities times are written from JavaScript Dates (read back as Dates);
   // audio_files.created_at is written by MySQL (read with UNIX_TIMESTAMP), as elsewhere.
   const [rows] = await db.query(
@@ -35,10 +37,12 @@ export async function opportunityBoard({ now = Date.now() } = {}) {
             p.id AS person_id, p.name AS person_name, p.category, p.role_title, p.organisation, p.city, p.score, p.last_contact_at, p.last_contact_kind,
             j.kind AS source_kind, f.original_name AS source_name, UNIX_TIMESTAMP(f.created_at) AS source_epoch
        FROM opportunities o
-       JOIN people p ON p.id = o.person_id
-       LEFT JOIN processing_jobs j ON j.id = o.source_job_id
+       JOIN people p ON p.id = o.person_id AND p.user_id = o.user_id
+       LEFT JOIN processing_jobs j ON j.id = o.source_job_id AND j.user_id = o.user_id
        LEFT JOIN audio_files f ON f.id = j.audio_file_id
+      WHERE o.user_id = ?
       ORDER BY o.updated_at DESC`,
+    [user],
   );
   // Each opportunity's latest stage change (migration 014): when, and the stage it came from (so the
   // card can say "from Negotiation" after a move). Before that table, its last update.
@@ -48,7 +52,10 @@ export async function opportunityBoard({ now = Date.now() } = {}) {
     const [m] = await db.query(
       `SELECT c.opportunity_id, c.from_stage, c.to_stage, c.created_at AS at
          FROM opportunity_stage_changes c
-         JOIN (SELECT opportunity_id, MAX(id) AS last_id FROM opportunity_stage_changes GROUP BY opportunity_id) l ON l.last_id = c.id`,
+         JOIN (SELECT sc.opportunity_id, MAX(sc.id) AS last_id
+                 FROM opportunity_stage_changes sc JOIN opportunities o ON o.id = sc.opportunity_id
+                WHERE o.user_id = ? GROUP BY sc.opportunity_id) l ON l.last_id = c.id`,
+      [user],
     );
     moved = new Map(m.map((r) => [r.opportunity_id, dateIso(r.at)]));
     cameFrom = new Map(m.filter((r) => r.from_stage).map((r) => [r.opportunity_id, { stage: r.from_stage, to: r.to_stage, at: dateIso(r.at) }]));
