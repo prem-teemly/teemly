@@ -5698,6 +5698,15 @@ a.tb-btn {
   line-height: 1.45;
   color: var(--or-navy);
 }
+/* Today while searching: what the page is showing. */
+.td-searching {
+  margin: 0 0 16px;
+  padding: 10px 14px;
+  border-radius: 10px;
+  background: var(--or-teal-soft);
+  font-size: 14px;
+  color: var(--or-navy);
+}
 /* Top-bar search across the room: results under the box. */
 .gs {
   position: relative;

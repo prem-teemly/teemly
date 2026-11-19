@@ -4,6 +4,7 @@ import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useCallback, useEffect, useState } from "react";
 import { deptStyle } from "../lib/departments";
+import { matchesQuery, searching } from "../lib/match";
 import { withFrom } from "../lib/origin";
 import { dueLabel, interestOf, rupees, setCommitmentDone, stageClass, updateOpportunity } from "../lib/people";
 import { type TodayData, getFollowUps, getInsights, getToday, getTopOpportunities, startOf } from "../lib/today";
@@ -40,11 +41,26 @@ function Empty({ children }: { children: React.ReactNode }) {
   return <p className="td-empty">{children}</p>;
 }
 
+/** What a section says when the search matches nothing in it. */
+const NoMatch = ({ q }: { q: string }) => <Empty>Nothing here matches “{q.trim()}”.</Empty>;
+
+/**
+ * A paged section while searching: load the rest of its items (at most `max` per request) so the
+ * search sees all of them, not only the first page.
+ */
+function useLoadAllWhileSearching(q: string, left: number, loading: boolean, failed: boolean, loadMore: (size: number) => void, max: number) {
+  useEffect(() => {
+    if (searching(q) && left > 0 && !loading && !failed) loadMore(max);
+  }, [q, left, loading, failed, loadMore, max]);
+}
+
 const NUDGE_LABEL: Record<TodayData["attention"][number]["kind"], string> = { overdue: "Overdue", quiet: "Gone quiet", committed: "Committed, not won", stalled: "Stalled" };
 const cap = (s: string) => s.charAt(0).toUpperCase() + s.slice(1).toLowerCase();
 
 /** Needs attention: the panel's nudges, full width, most important first. */
-function Attention({ items }: { items: TodayData["attention"] }) {
+function Attention({ items: all, q }: { items: TodayData["attention"]; q: string }) {
+  const items = all.filter((n) => matchesQuery(q, n.text, n.title, n.person?.name, NUDGE_LABEL[n.kind]));
+  if (searching(q) && !items.length) return null; // nothing here for this search
   if (!items.length)
     return (
       <p className="td-allclear">
@@ -84,22 +100,23 @@ const INSIGHTS_PAGE = 4;
 const UNREAD_FIRST = 3;
 type Insight = TodayData["insights"]["items"][number];
 
-function Insights({ data }: { data: TodayData["insights"] }) {
+function Insights({ data, q }: { data: TodayData["insights"]; q: string }) {
   const [extra, setExtra] = useState<Insight[]>([]);
   const [loading, setLoading] = useState(false);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [allUnread, setAllUnread] = useState(false);
   const seen = new Set<string>();
-  const items = [...data.items, ...extra].filter((i) => !seen.has(i.id) && !!seen.add(i.id));
-  const left = Math.max(0, data.total - items.length);
-  const unread = allUnread ? data.not_read_top : data.not_read_top.slice(0, UNREAD_FIRST);
+  const loaded = [...data.items, ...extra].filter((i) => !seen.has(i.id) && !!seen.add(i.id));
+  const left = Math.max(0, data.total - loaded.length);
+  const items = loaded.filter((i) => matchesQuery(q, i.person.name, i.title, i.factor?.label, i.would_change));
+  const unreadAll = data.not_read_top.filter((o) => matchesQuery(q, o.person.name, o.title));
+  const unread = allUnread || searching(q) ? unreadAll : unreadAll.slice(0, UNREAD_FIRST);
 
-  async function loadMore() {
-    if (loading) return;
+  async function loadMore(size = INSIGHTS_PAGE) {
     setLoading(true);
     setLoadError(null);
     try {
-      const page = await getInsights(items.length, INSIGHTS_PAGE);
+      const page = await getInsights(loaded.length, size);
       setExtra((x) => [...x, ...page.items]);
     } catch (e) {
       setLoadError(message(e));
@@ -107,6 +124,7 @@ function Insights({ data }: { data: TodayData["insights"] }) {
       setLoading(false);
     }
   }
+  useLoadAllWhileSearching(q, left, loading, !!loadError, loadMore, 20);
 
   return (
     <section className="td-card" aria-labelledby="td-ai">
@@ -120,7 +138,11 @@ function Insights({ data }: { data: TodayData["insights"] }) {
       </div>
       <p className="td-card-sub">At-risk deals first, then the biggest change in expected rupees: the AI&apos;s chance vs the stage&apos;s, and what would help</p>
       {items.length === 0 ? (
-        <Empty>No AI view yet. Open a deal and the AI reads its calls.</Empty>
+        searching(q) ? (
+          !unread.length && <NoMatch q={q} />
+        ) : (
+          <Empty>No AI view yet. Open a deal and the AI reads its calls.</Empty>
+        )
       ) : (
         <ul className="td-ai" aria-live="polite">
           {items.map((i) => {
@@ -156,7 +178,7 @@ function Insights({ data }: { data: TodayData["insights"] }) {
           })}
         </ul>
       )}
-      {(left > 0 || extra.length > 0) && (
+      {!searching(q) && (left > 0 || extra.length > 0) && (
         <div className="td-fu-more">
           {left > 0 && (
             <button type="button" className="td-more" disabled={loading} aria-busy={loading} onClick={() => void loadMore()}>
@@ -175,7 +197,7 @@ function Insights({ data }: { data: TodayData["insights"] }) {
           {loadError}
         </p>
       )}
-      {data.not_read > 0 && (
+      {data.not_read > 0 && (!searching(q) || unread.length > 0) && (
         <p className="td-ai-unread">
           Not read yet:{" "}
           {unread.map((o, k) => (
@@ -187,7 +209,7 @@ function Insights({ data }: { data: TodayData["insights"] }) {
               </Link>
             </span>
           ))}
-          {data.not_read_top.length > UNREAD_FIRST && (
+          {!searching(q) && data.not_read_top.length > UNREAD_FIRST && (
             <>
               {" "}
               <button type="button" className="td-more td-more-inline" aria-expanded={allUnread} onClick={() => setAllUnread((x) => !x)}>
@@ -196,7 +218,7 @@ function Insights({ data }: { data: TodayData["insights"] }) {
             </>
           )}
           {/* An older backend sends only three names: the rest as a count. */}
-          {data.not_read > data.not_read_top.length && ` and ${data.not_read - data.not_read_top.length} more`}
+          {!searching(q) && data.not_read > data.not_read_top.length && ` and ${data.not_read - data.not_read_top.length} more`}
         </p>
       )}
     </section>
@@ -204,7 +226,8 @@ function Insights({ data }: { data: TodayData["insights"] }) {
 }
 
 /** Stage movement in the period, net per deal. */
-function Moves({ data, period }: { data: TodayData["moves"]; period: string }) {
+function Moves({ data: all, period, q }: { data: TodayData["moves"]; period: string; q: string }) {
+  const data = { ...all, items: all.items.filter((m) => matchesQuery(q, m.person.name, m.title, m.from, m.to)) };
   return (
     <section className="td-card" aria-labelledby="td-moves">
       <div className="td-card-head">
@@ -213,7 +236,9 @@ function Moves({ data, period }: { data: TodayData["moves"]; period: string }) {
           {data.forward} forward · {data.back} back
         </span>
       </div>
-      {data.items.length === 0 ? (
+      {data.items.length === 0 && searching(q) ? (
+        <NoMatch q={q} />
+      ) : data.items.length === 0 ? (
         <Empty>
           No deal changed stage {period}.
           {data.unchanged > 0 && ` ${data.unchanged} ${data.unchanged === 1 ? "was" : "were"} moved and moved back.`}
@@ -238,7 +263,7 @@ function Moves({ data, period }: { data: TodayData["moves"]; period: string }) {
               {m.value_inr !== null && <span className="td-move-value">{rupees(m.value_inr)}</span>}
             </li>
           ))}
-          {data.unchanged > 0 && (
+          {data.unchanged > 0 && !searching(q) && (
             <li className="td-faint td-move-note">
               {data.unchanged} more {data.unchanged === 1 ? "was" : "were"} moved and moved back.
             </li>
@@ -250,8 +275,24 @@ function Moves({ data, period }: { data: TodayData["moves"]; period: string }) {
 }
 
 /** Inbox: people and departments found in calls, waiting for a decision. */
-function InboxCard({ data }: { data: TodayData["inbox"] }) {
+function InboxCard({ data: all, q }: { data: TodayData["inbox"]; q: string }) {
+  // While searching: only the names that match (the counts become those matches).
+  const people = all.people_names.filter((x) => matchesQuery(q, x));
+  const depts = all.department_names.filter((x) => matchesQuery(q, x));
+  const data = searching(q) ? { people: people.length, people_names: people, departments: depts.length, department_names: depts } : all;
   const total = data.people + data.departments;
+  if (searching(q) && total === 0)
+    return (
+      <section className="td-card" aria-labelledby="td-inbox">
+        <div className="td-card-head">
+          <h2 id="td-inbox">Inbox</h2>
+          <Link href="/inbox" className="td-link">
+            Open Inbox
+          </Link>
+        </div>
+        <NoMatch q={q} />
+      </section>
+    );
   return (
     <section className="td-card" aria-labelledby="td-inbox">
       <div className="td-card-head">
@@ -301,22 +342,22 @@ function InboxCard({ data }: { data: TodayData["inbox"] }) {
 const TOP_PAGE = 5;
 type Top = TodayData["top"][number];
 
-function TopOpportunities({ first, total }: { first: Top[]; total: number }) {
+function TopOpportunities({ first, total, q }: { first: Top[]; total: number; q: string }) {
   const router = useRouter();
   const [extra, setExtra] = useState<Top[]>([]);
   const [loading, setLoading] = useState(false);
   const [loadError, setLoadError] = useState<string | null>(null);
   const seen = new Set<string>();
-  const visible = [...first, ...extra].filter((o) => !seen.has(o.id) && !!seen.add(o.id));
-  const left = Math.max(0, total - visible.length);
+  const loaded = [...first, ...extra].filter((o) => !seen.has(o.id) && !!seen.add(o.id));
+  const left = Math.max(0, total - loaded.length);
+  const visible = loaded.filter((o) => matchesQuery(q, o.person.name, o.title, o.department, o.stage, o.next_step, o.reason?.text));
   const open = (id: string) => router.push(withFrom(`/opportunities/${id}`, "today"));
 
-  async function loadMore() {
-    if (loading) return;
+  async function loadMore(size = TOP_PAGE) {
     setLoading(true);
     setLoadError(null);
     try {
-      const page = await getTopOpportunities(visible.length, TOP_PAGE);
+      const page = await getTopOpportunities(loaded.length, size);
       setExtra((x) => [...x, ...page.items]);
     } catch (e) {
       setLoadError(message(e));
@@ -324,6 +365,7 @@ function TopOpportunities({ first, total }: { first: Top[]; total: number }) {
       setLoading(false);
     }
   }
+  useLoadAllWhileSearching(q, left, loading, !!loadError, loadMore, 50);
 
   return (
     <section className="td-card" aria-labelledby="td-top">
@@ -336,7 +378,9 @@ function TopOpportunities({ first, total }: { first: Top[]; total: number }) {
       <p className="td-card-sub">
         Ranked by value × chance × how soon it is due{total > 0 ? ` · ${total} open ${total === 1 ? "deal" : "deals"}` : ""}
       </p>
-      {visible.length === 0 ? (
+      {visible.length === 0 && searching(q) ? (
+        loading ? <Empty>Searching…</Empty> : <NoMatch q={q} />
+      ) : visible.length === 0 ? (
         <Empty>No open opportunities yet. Upload a call and they appear here.</Empty>
       ) : (
         <ul className="td-top" aria-live="polite">
@@ -387,7 +431,7 @@ function TopOpportunities({ first, total }: { first: Top[]; total: number }) {
           ))}
         </ul>
       )}
-      {(left > 0 || extra.length > 0) && (
+      {!searching(q) && (left > 0 || extra.length > 0) && (
         <div className="td-fu-more">
           {left > 0 && (
             <button type="button" className="td-more" disabled={loading} aria-busy={loading} onClick={() => void loadMore()}>
@@ -433,7 +477,7 @@ function dueOf(f: FollowUp): { text: string | null; late: boolean } {
   return { text: f.due_text, late: false };
 }
 
-function FollowUps({ items, total, onDone }: { items: FollowUp[]; total: number; onDone: (f: FollowUp) => Promise<void> }) {
+function FollowUps({ items, total, onDone, q }: { items: FollowUp[]; total: number; onDone: (f: FollowUp) => Promise<void>; q: string }) {
   const [extra, setExtra] = useState<FollowUp[]>([]); // pages loaded after the first
   const [loading, setLoading] = useState(false);
   const [loadError, setLoadError] = useState<string | null>(null);
@@ -441,15 +485,17 @@ function FollowUps({ items, total, onDone }: { items: FollowUp[]; total: number;
   const keyOf = (f: FollowUp) => `${f.kind}-${f.id}`;
   // The first page (refreshed with Today) and the pages loaded since, each item once.
   const seen = new Set<string>();
-  const visible = [...items, ...extra].filter((f) => !seen.has(keyOf(f)) && !!seen.add(keyOf(f)));
-  const left = Math.max(0, total - visible.length);
+  const loaded = [...items, ...extra].filter((f) => !seen.has(keyOf(f)) && !!seen.add(keyOf(f)));
+  const left = Math.max(0, total - loaded.length);
+  const visible = loaded.filter((f) =>
+    matchesQuery(q, f.text, f.person?.name, f.person?.organisation, f.person?.city, f.by, f.deal_info?.title, f.source?.file_name),
+  );
 
-  async function loadMore() {
-    if (loading) return;
+  async function loadMore(size = FU_PAGE) {
     setLoading(true);
     setLoadError(null);
     try {
-      const page = await getFollowUps(visible.length, FU_PAGE);
+      const page = await getFollowUps(loaded.length, size);
       setExtra((x) => [...x, ...page.items]);
     } catch (e) {
       setLoadError(message(e));
@@ -457,6 +503,7 @@ function FollowUps({ items, total, onDone }: { items: FollowUp[]; total: number;
       setLoading(false);
     }
   }
+  useLoadAllWhileSearching(q, left, loading, !!loadError, loadMore, 50);
 
   async function done(f: FollowUp) {
     const k = keyOf(f);
@@ -479,7 +526,9 @@ function FollowUps({ items, total, onDone }: { items: FollowUp[]; total: number;
         <h2 id="td-fu">Follow-ups</h2>
         <span className="td-faint">{total} open</span>
       </div>
-      {items.length === 0 ? (
+      {visible.length === 0 && searching(q) ? (
+        loading ? <Empty>Searching…</Empty> : <NoMatch q={q} />
+      ) : items.length === 0 ? (
         <Empty>No follow-ups. Next steps and promises from calls show here.</Empty>
       ) : (
         <ul className="td-fu" aria-live="polite">
@@ -518,7 +567,7 @@ function FollowUps({ items, total, onDone }: { items: FollowUp[]; total: number;
           })}
         </ul>
       )}
-      {(left > 0 || extra.length > 0) && (
+      {!searching(q) && (left > 0 || extra.length > 0) && (
         <div className="td-fu-more">
           {left > 0 && (
             <button type="button" className="td-more" disabled={loading} aria-busy={loading} onClick={() => void loadMore()}>
@@ -545,6 +594,7 @@ export default function TodayPage() {
   const [range, setRange] = useState<Range>("today");
   const [data, setData] = useState<TodayData | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [q, setQ] = useState(""); // the top bar's search: only what is on this page
 
   // Remember the range per browser (a convenience only).
   useEffect(() => {
@@ -601,9 +651,21 @@ export default function TodayPage() {
 
   const period = range === "today" ? "today" : "this week";
   const n = data?.numbers;
+  // While searching, each list on the page shows only its matches.
+  const pipeline = (data?.pipeline ?? []).filter((d) => matchesQuery(q, d.name));
+  const live = (data?.live ?? []).filter((j) => matchesQuery(q, j.file_name, j.stage_label));
+  const heat = (data?.investor_heat ?? []).filter((p) => matchesQuery(q, p.name));
 
   return (
-    <PeopleChrome active="today">
+    <PeopleChrome active="today" search={q} onSearch={setQ} placeholder="Search this page: people, deals, follow-ups...">
+      {searching(q) && (
+        <p className="td-searching" role="status">
+          Showing what matches “{q.trim()}” on this page.{" "}
+          <button type="button" className="pw-link" onClick={() => setQ("")}>
+            Clear
+          </button>
+        </p>
+      )}
       <div className="pl-head td-head">
         <div>
           <h1 className="pl-title">
@@ -663,15 +725,15 @@ export default function TodayPage() {
             />
           </div>
 
-          <Attention items={data.attention} />
+          <Attention items={data.attention} q={q} />
 
           <div className="td-grid">
             <div className="td-col">
-              <TopOpportunities first={data.top} total={data.top_total ?? data.top.length} />
+              <TopOpportunities first={data.top} total={data.top_total ?? data.top.length} q={q} />
 
-              <Insights key={data.since} data={data.insights} />
+              <Insights key={data.since} data={data.insights} q={q} />
 
-              <Moves data={data.moves} period={period} />
+              <Moves data={data.moves} period={period} q={q} />
 
               <section className="td-card" aria-labelledby="td-pipe">
                 <div className="td-card-head">
@@ -680,12 +742,12 @@ export default function TodayPage() {
                     Departments
                   </Link>
                 </div>
-                {data.pipeline.length === 0 ? (
-                  <Empty>No open deal amounts yet.</Empty>
+                {pipeline.length === 0 ? (
+                  searching(q) ? <NoMatch q={q} /> : <Empty>No open deal amounts yet.</Empty>
                 ) : (
                   <ul className="td-pipe">
-                    {data.pipeline.map((d) => {
-                      const max = data.pipeline[0].open_value_inr || 1;
+                    {pipeline.map((d) => {
+                      const max = data.pipeline[0]?.open_value_inr || 1;
                       const c = deptStyle(d.color).color as string;
                       return (
                         <li key={d.slug}>
@@ -716,11 +778,11 @@ export default function TodayPage() {
                     <UploadIcon size={13} /> Upload
                   </Link>
                 </div>
-                {data.live.length === 0 ? (
-                  <Empty>Nothing being analysed right now. Upload a call and it shows here.</Empty>
+                {live.length === 0 ? (
+                  searching(q) ? <NoMatch q={q} /> : <Empty>Nothing being analysed right now. Upload a call and it shows here.</Empty>
                 ) : (
                   <ul className="td-live">
-                    {data.live.map((j) => (
+                    {live.map((j) => (
                       <li key={j.job_id}>
                         <div className="td-live-top">
                           <span className="td-live-name" title={j.file_name}>
@@ -745,7 +807,7 @@ export default function TodayPage() {
                 )}
               </section>
 
-              <InboxCard data={data.inbox} />
+              <InboxCard data={data.inbox} q={q} />
 
               <section className="td-card" aria-labelledby="td-heat">
                 <div className="td-card-head">
@@ -754,11 +816,11 @@ export default function TodayPage() {
                     Investment
                   </Link>
                 </div>
-                {data.investor_heat.length === 0 ? (
-                  <Empty>No investors yet.</Empty>
+                {heat.length === 0 ? (
+                  searching(q) ? <NoMatch q={q} /> : <Empty>No investors yet.</Empty>
                 ) : (
                   <ul className="td-heat">
-                    {data.investor_heat.map((p) => (
+                    {heat.map((p) => (
                       <li key={p.id}>
                         <Link href={withFrom(`/people/${p.id}`, "today")} className="td-heat-name">
                           {p.name}
@@ -780,7 +842,7 @@ export default function TodayPage() {
                 )}
               </section>
 
-              <FollowUps items={data.follow_ups} total={n.follow_ups} onDone={markDone} />
+              <FollowUps items={data.follow_ups} total={n.follow_ups} onDone={markDone} q={q} />
 
             </div>
           </div>

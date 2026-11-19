@@ -6,6 +6,7 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import FilterMenu, { type FilterOption } from "./FilterMenu";
 import { type DeptWithCount, deptStyle, useDepartments } from "../lib/departments";
 import { type Board, type BoardOpportunity, type Nudge, getBoard, totals } from "../lib/opportunities";
+import { matchesQuery, searching } from "../lib/match";
 import { withFrom } from "../lib/origin";
 import { type Person, STAGES, STAGE_CHANCE, type Stage, addOpportunity, dayLabel, dueLabel, getPeople, rupees, stageClass, updateOpportunity } from "../lib/people";
 import { PhoneIcon, PlusIcon, SparkleIcon, WhatsAppIcon } from "./Icons";
@@ -265,6 +266,7 @@ export default function OpportunityPanel() {
   const [opps, setOpps] = useState<BoardOpportunity[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [dept, setDept] = useState("all");
+  const [q, setQ] = useState(""); // the top bar's search: this panel's deals only
   const [view, setView] = useState<View>("board");
   const [dragId, setDragId] = useState<string | null>(null);
   const [over, setOver] = useState<Stage | null>(null);
@@ -290,12 +292,20 @@ export default function OpportunityPanel() {
     void load();
   }, [load]);
 
-  // Filter: department.
-  const shown = useMemo(() => opps.filter((o) => dept === "all" || (dept === "none" ? !o.department : o.department === dept)), [opps, dept]);
+  // Filters: department, and the search (deal, person, company, city, department, stage, next step).
+  const shown = useMemo(
+    () =>
+      opps.filter(
+        (o) =>
+          (dept === "all" || (dept === "none" ? !o.department : o.department === dept)) &&
+          matchesQuery(q, o.title, o.person.name, o.person.organisation, o.person.city, o.person.role_title, o.department, o.stage, o.next_step),
+      ),
+    [opps, dept, q],
+  );
   const sum = totals(shown);
   const won = shown.filter((o) => o.stage === "Won").length;
   const lost = shown.filter((o) => o.stage === "Lost");
-  const filtered = dept !== "all";
+  const filtered = dept !== "all" || searching(q);
 
   /** Save a stage move: shown at once, sent to the server, put back if it could not be saved. */
   async function move(id: string, to: Stage) {
@@ -329,7 +339,7 @@ export default function OpportunityPanel() {
   const nudgeOpp = nudge ? opps.find((o) => o.id === nudge.opportunity_id) : undefined;
 
   return (
-    <PeopleChrome active="opportunity-panel">
+    <PeopleChrome active="opportunity-panel" search={q} onSearch={setQ} placeholder="Search deals, people, company, stage...">
       <div className="pl-head op-head">
         <div>
           <h1 className="pl-title">Opportunity panel</h1>
@@ -384,6 +394,14 @@ export default function OpportunityPanel() {
         <div className="card pl-state">
           <p className="pl-state-title">No opportunities yet</p>
           <p>Upload a call: deals talked about in it appear here with their stage, amount and the call they came from. Or add one with “+ Opportunity”.</p>
+        </div>
+      ) : searching(q) && !shown.length ? (
+        <div className="card pl-state">
+          <p className="pl-state-title">No deals match “{q.trim()}”</p>
+          <p>Search looks at the deal, the person, their company and city, the department, the stage and the next step.</p>
+          <button type="button" className="pl-view" onClick={() => setQ("")}>
+            Clear search
+          </button>
         </div>
       ) : view === "board" ? (
         <div className="op-board" aria-label="Opportunities by stage">
