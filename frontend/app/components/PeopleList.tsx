@@ -93,6 +93,12 @@ export default function PeopleList() {
   const [people, setPeople] = useState<Person[] | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [q, setQ] = useState("");
+  // Opened from the top-bar search ("All people matching…"): start with its words.
+  useEffect(() => {
+    const fromUrl = new URLSearchParams(window.location.search).get("q");
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- reading the URL once on load
+    if (fromUrl) setQ(fromUrl.slice(0, 80));
+  }, []);
   const [view, setView] = useState<View>("all");
   const [cats, setCats] = useState<Set<string>>(new Set());
   const [cities, setCities] = useState<Set<string>>(new Set());

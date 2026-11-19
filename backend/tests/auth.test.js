@@ -386,6 +386,17 @@ test("one room per account: people, opportunities, departments, calls, inbox, co
   assert.equal((await S.get("/api/people-check?phone=%2B919876543210")).body.phone_match, null);
   assert.equal((await S.post("/api/people", { name: "Vimal Raj", phone: "+919876543210" })).status, 201);
   assert.equal((await S.post("/api/departments", { name: "Customer Success" })).status, 201);
+  // Search finds only your own room: Prem's deal for Prem, nothing of it for Sanjay.
+  const ps = (await P.get("/api/search?q=billing")).body;
+  assert.deepEqual(ps.opportunities.map((o) => o.title), ["Billing software"]);
+  assert.equal(ps.opportunities[0].link, `/opportunities/${oid}`);
+  const ss = (await S.get("/api/search?q=billing")).body;
+  assert.deepEqual([ss.people, ss.opportunities, ss.calls, ss.notes].map((x) => x.length), [0, 0, 0, 0]);
+  assert.deepEqual((await S.get("/api/search?q=vimal")).body.people.map((p) => p.link), (await S.get("/api/people")).body.people.filter((p) => p.name === "Vimal Raj").map((p) => `/people/${p.id}`), "Sanjay's own Vimal only");
+  assert.equal((await P.get("/api/search?q=v")).body.people.length, 0, "2 letters at least");
+  assert.equal((await P.get("/api/search?q=%25")).status, 200, "% is searched as a character");
+  assert.equal((await fetch(base + "/api/search?q=vimal")).status, 401);
+
   // Prem's things are unchanged.
   assert.equal((await P.get(`/api/opportunities/${oid}`)).body.opportunity.stage, "Identified");
   assert.equal((await P.get("/api/people")).body.people.filter((p) => p.name === "Vimal Raj").length, 1);

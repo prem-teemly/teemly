@@ -3,6 +3,7 @@
 import Link from "next/link";
 import { useState } from "react";
 import AddPersonDialog from "./AddPersonDialog";
+import GlobalSearch from "./GlobalSearch";
 import { UserAvatar } from "./AuthGate";
 import { PlusIcon, SearchIcon, UploadIcon } from "./Icons";
 import NotificationBell from "./NotificationBell";
@@ -32,19 +33,24 @@ export default function PeopleChrome({
       <Sidebar active={active} />
       <div className="app">
         <header className="topbar">
-          <label className="search">
-            <SearchIcon size={16} className="search-icon" />
-            <input
-              type="search"
-              placeholder={placeholder}
-              aria-label="Search"
-              value={search ?? ""}
-              onChange={(e) => onSearch?.(e.target.value)}
-              onKeyDown={(e) => e.key === "Escape" && onSearch?.("")}
-              readOnly={!onSearch}
-            />
-            <kbd className="search-kbd">/</kbd>
-          </label>
+          {onSearch ? (
+            // A page that filters its own list (People) uses the box for that.
+            <label className="search">
+              <SearchIcon size={16} className="search-icon" />
+              <input
+                type="search"
+                placeholder={placeholder}
+                aria-label="Search"
+                value={search ?? ""}
+                onChange={(e) => onSearch(e.target.value)}
+                onKeyDown={(e) => e.key === "Escape" && onSearch("")}
+              />
+              <kbd className="search-kbd">/</kbd>
+            </label>
+          ) : (
+            // Every other page: search the whole room (people, deals, calls, notes).
+            <GlobalSearch />
+          )}
           <div className="topbar-actions">
             <Link href="/" className="tb-btn tb-btn-outline" title="Upload a call recording">
               <UploadIcon size={16} />

@@ -29,6 +29,7 @@ import * as detailDb from "./db/opportunityDetail.js";
 import * as todayDb from "./db/today.js";
 import * as notesDb from "./db/notifications.js";
 import * as networkDb from "./db/network.js";
+import * as searchDb from "./db/search.js";
 import { InsightUnavailable } from "./services/opportunityInsight.js";
 import { BUILT_IN as BUILT_IN_DEPARTMENTS, departmentNames } from "./db/departments.js";
 import { STAGES, normalizeStage } from "./stages.js";
@@ -1073,6 +1074,18 @@ route(
     const limit = Math.min(todayDb.FOLLOW_UPS_MAX_PAGE, Math.max(1, int(req.query.limit, todayDb.FOLLOW_UPS_FIRST)));
     const offset = Math.min(100_000, Math.max(0, int(req.query.offset, 0)));
     return sendJson(res, 200, { status: "success", ...(await todayDb.followUpsPage({ offset, limit })) });
+  }),
+);
+
+// The top bar's search: the signed-in user's people, deals, calls and notes matching ?q= (2+ letters).
+route(
+  "GET",
+  "/api/search",
+  h(async (req, res) => {
+    peopleStore(); // 503 without the database
+    const q = typeof req.query.q === "string" ? req.query.q.replace(/\s+/g, " ").trim().slice(0, 80) : "";
+    if ([...q].length < searchDb.MIN_QUERY) return sendJson(res, 200, { status: "success", q, people: [], opportunities: [], calls: [], notes: [] });
+    return sendJson(res, 200, { status: "success", q, ...(await searchDb.searchRoom(q)) });
   }),
 );
 
